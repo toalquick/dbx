@@ -1,0 +1,543 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Subledger Finder</title>
+<style>
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: var(--color-bg, Canvas); color: var(--color-text, CanvasText); }
+main { max-width: 1300px; margin: auto; }
+h1 { margin-top: 0; } h2 { font-size: 18px; }
+section { border: 1px solid color-mix(in srgb, CanvasText 20%, transparent); border-radius: 8px; padding: 18px; margin: 18px 0; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; }
+label { display: grid; gap: 6px; font-size: 14px; }
+input, select, textarea, button { font: inherit; padding: 9px; border-radius: 5px; border: 1px solid color-mix(in srgb, CanvasText 25%, transparent); background: Canvas; color: CanvasText; }
+button { cursor: pointer; margin: 12px 8px 0 0; } button:disabled { opacity: .5; cursor: wait; }
+.primary { background: #2563eb; color: white; }
+p { line-height: 1.5; } .hint { opacity: .75; font-size: 14px; }
+#status { padding: 12px; white-space: pre-wrap; } #status[data-error="true"] { color: light-dark(#a51d20, #ff9292); }
+.scroll { overflow: auto; max-height: 450px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 8px; border-bottom: 1px solid color-mix(in srgb, CanvasText 20%, transparent); white-space: nowrap; }
+textarea { width: 100%; min-height: 220px; font-family: ui-monospace, monospace; font-size: 12px; }
+[hidden] { display: none !important; }
+</style>
+</head>
+<body><main>
+<h1>Subledger Finder</h1>
+<p>Trace customer or supplier entries through reference numbers and balance history identity IDs. Keep the earliest history row (lowest UID), remove later loaded rows, and restore balances from that first row.</p>
+<form id="form">
+<section><h2>Scope</h2><div class="grid">
+<label>Subledger type<select id="type"><option value="customer">Customer</option><option value="supplier">Supplier</option></select></label>
+<label>Client UID<input id="client" required placeholder="One client UID"></label>
+<label>Customer / supplier UIDs<input id="entities" required placeholder="12345, 67890"></label>
+<label>Initial subledger UIDs<input id="seeds" required value="*" placeholder="12345, 67890 or *"></label>
+</div><p class="hint">Connections stay within the selected client and customers/suppliers. * selects all entries for that scope.</p></section>
+<section><h2>Data source</h2>
+<label>Load from<select id="source"><option value="live">Open DBX connection</option><option value="csv">CSV exports</option></select></label>
+<div id="liveFields"><p class="hint">Right-click a database or table and choose the “Troubleshoot subledgers” action. DBX asks for read access on first use.</p>
+<div class="grid">
+<label>Connection ID<input id="connection" required></label>
+<label>Database (optional)<input id="database"></label>
+</div></div>
+<div class="grid">
+<label>Schema (optional)<input id="schema" placeholder="e.g. dbo or public"></label>
+<label>SQL dialect<select id="dialect"><option value="postgres">PostgreSQL</option><option value="mssql">SQL Server</option><option value="mysql">MySQL / MariaDB</option><option value="sqlite">SQLite</option></select></label>
+</div>
+<div id="csvFields" hidden><p class="hint">Export complete data for the selected scope. Headers are case-insensitive; comma, semicolon and tab delimiters are supported. Identifiers and decimal amounts retain their original precision.</p><div class="grid">
+<label>Subledger CSV<input id="ledgerFile" type="file" accept=".csv,.tsv,text/csv"></label>
+<label>Subledger balance history CSV<input id="historyFile" type="file" accept=".csv,.tsv,text/csv"></label>
+</div></div>
+<button class="primary" id="analyze" type="submit">Find connected subledgers</button>
+</section></form>
+<section id="snapshotSection"><h2>Snapshot and restore both tables</h2>
+<p>PostgreSQL: save a complete database copy of <strong>both tables, across all clients</strong>, before correcting data. This preserves every column, not just the fields used in analysis. Snapshots are independent of the customer/supplier scope above.</p>
+<p class="hint">Set the connection, database and schema above. Prepare the SQL here, then copy it into DBX’s SQL editor and execute the entire statement. Preparing or saving a plan does not create a snapshot. A successful snapshot creates three persistent backup tables in that schema.</p>
+<label>Snapshot ID<input id="snapshotToken" maxlength="32" placeholder="e.g. before_cleanup_20261015"></label>
+<button id="newSnapshot" type="button">New snapshot ID</button>
+<button id="prepareSnapshot" type="button">Prepare snapshot SQL</button>
+<button id="prepareRestore" type="button">Prepare restore SQL</button>
+<button id="checkSnapshot" type="button">Check snapshot</button>
+<button id="savePlan" type="button">Save recovery plan</button>
+<label style="margin-top:12px">Load saved recovery plan<input id="loadPlan" type="file" accept=".json,application/json"></label>
+<p id="snapshotInfo" role="status" class="hint"></p>
+<div id="snapshotPreview" hidden>
+<p id="snapshotOperation"></p>
+<textarea id="snapshotSql" readonly aria-label="Snapshot or restore SQL" spellcheck="false"></textarea>
+<button id="copySnapshotSql" type="button">Copy SQL</button>
+<button id="saveSnapshotSql" type="button">Save SQL file</button>
+</div>
+<p class="hint">Restore replaces all rows in both tables with the snapshot, including removal of rows added afterward. It keeps the original tables, verifies the restored rows, and rolls back on failure. Foreign keys and triggers remain enabled; external references can prevent restore. This is a row-data recovery tool, not a database backup or schema/sequence rollback. Snapshot tables reside in the same database: retain your normal database backups.</p>
+</section>
+<div id="status" role="status" aria-live="polite"></div>
+<div id="results" hidden>
+<section><h2>Analysis</h2><p id="summary"></p><ul id="warnings"></ul>
+<div class="scroll"><table><thead><tr><th>UID</th><th>Entity UID</th><th>Reference</th><th>Cross reference</th><th>Amount</th><th>Balance</th><th>Description</th><th>Journal date</th></tr></thead><tbody id="rows"></tbody></table></div>
+<button id="copyUids" type="button">Copy UIDs</button></section>
+<section><h2>Correction SQL</h2>
+<p>Review warnings and SQL before running it in DBX’s SQL editor. Use a transaction and verify affected row counts. Statements target the loaded client and row UIDs and check original values. Reload after any database change; loading both tables does not create a database snapshot.</p>
+<textarea id="sql" readonly aria-label="Correction SQL" spellcheck="false"></textarea>
+<button id="copySql" type="button">Copy correction SQL</button>
+</section></div>
+<script id="core">
+'use strict';
+const Subledger = (() => {
+  function id(value, label = 'UID') {
+    if (typeof value === 'number' && !Number.isSafeInteger(value)) throw new Error(`${label} lost precision; export identifiers as text.`);
+    const text = String(value ?? '').trim();
+    if (!/^\d+$/.test(text)) throw new Error(`${label} must be an unsigned integer.`);
+    return BigInt(text).toString();
+  }
+  function ids(text) {
+    const values = String(text).split(',').map(x => id(x));
+    return [...new Set(values)];
+  }
+  function decimal(value) {
+    if (value === null || value === undefined || String(value).trim() === '') throw new Error('Missing balance or amount; correction SQL is blocked.');
+    if (typeof value === 'number') throw new Error('Numeric amounts must be loaded as text to preserve decimal precision.');
+    const text = String(value).trim();
+    if (!/^[+-]?\d+(\.\d+)?$/.test(text)) throw new Error(`Invalid decimal amount: ${text}`);
+    let [whole, fraction = ''] = text.replace(/^[+-]/, '').split('.');
+    whole = BigInt(whole).toString(); fraction = fraction.replace(/0+$/, '');
+    return (text.startsWith('-') && (whole !== '0' || fraction) ? '-' : '') + whole + (fraction ? '.' + fraction : '');
+  }
+  function csv(text) {
+    text = text.replace(/^\uFEFF/, '');
+    // Count separators outside quoted fields, including quoted newlines in the first record.
+    let quote = false, first = '';
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (c === '"') { if (quote && text[i + 1] === '"') { i++; continue; } quote = !quote; }
+      if (!quote && (c === '\n' || c === '\r')) break;
+      if (!quote) first += c;
+    }
+    const delimiter = [',', ';', '\t'].sort((a, b) => first.split(b).length - first.split(a).length)[0];
+    const records = []; let row = [], field = '', quoted = false, closed = false;
+    function cell() { row.push(field); field = ''; closed = false; }
+    function record() { cell(); if (row.some(x => x.trim())) records.push(row); row = []; }
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (quoted) {
+        if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else { quoted = false; closed = true; } }
+        else field += c;
+      } else if (c === '"' && !field && !closed) quoted = true;
+      else if (c === delimiter) cell();
+      else if (c === '\n' || c === '\r') { if (c === '\r' && text[i + 1] === '\n') i++; record(); }
+      else { if (closed || c === '"') throw new Error('Malformed CSV quoting.'); field += c; }
+    }
+    if (quoted) throw new Error('Unclosed CSV quote.');
+    if (field || row.length || closed) record();
+    if (!records.length) throw new Error('CSV is empty.');
+    const headers = records.shift().map(x => x.trim().toLowerCase());
+    if (headers.some(x => !x || x === '__proto__') || new Set(headers).size !== headers.length) throw new Error('CSV headers must be nonempty and unique.');
+    return { columns: headers, rows: records.map((r, i) => {
+      if (r.length !== headers.length) throw new Error(`CSV row ${i + 2} has the wrong number of fields.`);
+      return Object.fromEntries(headers.map((h, n) => [h, r[n] === '' || /^null$/i.test(r[n]) ? null : r[n]]));
+    }) };
+  }
+  function normalize(data, required) {
+    const columns = data.columns.map(c => String(typeof c === 'string' ? c : c.name).toLowerCase());
+    for (const key of required) if (!columns.includes(key)) throw new Error(`Missing required column: ${key}`);
+    return data.rows.map(row => Object.fromEntries(columns.map((key, i) => [key, Array.isArray(row) ? row[i] : row[key]])));
+  }
+  function scope(input) {
+    if (!['customer', 'supplier'].includes(input.type)) throw new Error('Invalid subledger type.');
+    return { client: id(input.client, 'Client UID'), entities: ids(input.entities), seeds: input.seeds.trim() === '*' ? '*' : ids(input.seeds), type: input.type };
+  }
+  function analyze(ledgerData, historyData, input) {
+    const s = scope(input), entity = s.type + 'uid';
+    const ledger = normalize(ledgerData, ['uid', 'clientuid', entity, 'referencenumber', 'crossreferencenumber', 'amount', 'balance', 'basebalance']);
+    const history = normalize(historyData, ['uid', 'clientuid', 'subledgeruid', 'identityid', 'balance', 'basebalance', 'balancechange']);
+    const chosen = new Set(s.entities), ledgers = new Map(), histories = new Map(), historyUids = new Set();
+    for (const row of ledger) {
+      if (id(row.clientuid) !== s.client || row[entity] == null || !chosen.has(id(row[entity]))) continue;
+      const uid = id(row.uid); if (ledgers.has(uid)) throw new Error(`Duplicate subledger UID ${uid}.`);
+      ledgers.set(uid, { ...row, uid, clientuid: s.client });
+    }
+    if (!ledgers.size) throw new Error('No subledgers match the selected client and entity UIDs.');
+    for (const row of history) {
+      if (id(row.clientuid) !== s.client) continue;
+      const uid = id(row.uid), ledgerUid = id(row.subledgeruid);
+      if (!ledgers.has(ledgerUid)) continue;
+      if (historyUids.has(uid)) throw new Error(`Duplicate history UID ${uid}.`);
+      historyUids.add(uid);
+      const item = { ...row, uid, subledgeruid: ledgerUid, clientuid: s.client };
+      if (!histories.has(ledgerUid)) histories.set(ledgerUid, []);
+      histories.get(ledgerUid).push(item);
+    }
+    const refs = new Map(), identities = new Map();
+    function add(map, key, uid) { if (!map.has(key)) map.set(key, new Set()); map.get(key).add(uid); }
+    function reference(v) { return v == null || String(v) === '' ? null : String(v); }
+    function identity(v) { return v == null || String(v).trim() === '' || /^0+$/.test(String(v)) ? null : String(v); }
+    for (const [uid, row] of ledgers) {
+      for (const r of [reference(row.referencenumber), reference(row.crossreferencenumber)]) if (r !== null) add(refs, r, uid);
+      for (const h of histories.get(uid) || []) { const key = identity(h.identityid); if (key !== null) add(identities, key, uid); }
+    }
+    const queue = s.seeds === '*' ? [...ledgers.keys()] : [...s.seeds];
+    for (const uid of queue) if (!ledgers.has(uid)) throw new Error(`Initial subledger ${uid} is outside the selected scope or missing.`);
+    const connected = new Map(), visitedRefs = new Set(), visitedIdentities = new Set();
+    while (queue.length) {
+      const uid = queue.pop(); if (connected.has(uid)) continue;
+      const row = ledgers.get(uid); connected.set(uid, row);
+      for (const ref of [reference(row.referencenumber), reference(row.crossreferencenumber)]) {
+        if (ref === null || visitedRefs.has(ref)) continue;
+        visitedRefs.add(ref); for (const other of refs.get(ref)) if (!connected.has(other)) queue.push(other);
+      }
+      for (const h of histories.get(uid) || []) {
+        const key = identity(h.identityid); if (key === null || visitedIdentities.has(key)) continue;
+        visitedIdentities.add(key); for (const other of identities.get(key)) if (!connected.has(other)) queue.push(other);
+      }
+    }
+    const warnings = [], cleanup = [];
+    for (const [uid, row] of connected) {
+      const entries = (histories.get(uid) || []).sort((a, b) => BigInt(a.uid) < BigInt(b.uid) ? -1 : 1);
+      if (!entries.length) { warnings.push(`Subledger ${uid} has no history; no correction is generated for it.`); continue; }
+      const first = entries[0];
+      if (identity(first.identityid) !== null) warnings.push(`Subledger ${uid}: first history row has identity ID ${first.identityid}.`);
+      // Validate every numeric value before offering any SQL.
+      for (const h of entries) for (const key of ['balance', 'basebalance', 'balancechange']) decimal(h[key]);
+      for (const key of ['balance', 'basebalance', 'amount']) decimal(row[key]);
+      if (decimal(first.balancechange) !== decimal(first.balance)) warnings.push(`Subledger ${uid}: first balance change differs from its balance.`);
+      if (decimal(first.balance) !== decimal(row.amount)) warnings.push(`Subledger ${uid}: restored balance differs from the subledger amount.`);
+      cleanup.push({ row, first, remove: entries.slice(1), update: decimal(first.balance) !== decimal(row.balance) || decimal(first.basebalance) !== decimal(row.basebalance) });
+    }
+    return { scope: s, connected: [...connected.values()], identities: [...visitedIdentities], warnings, cleanup };
+  }
+  function table(name, schema, dialect) {
+    if (!['postgres', 'mssql', 'mysql', 'sqlite'].includes(dialect)) throw new Error('Unsupported SQL dialect.');
+    function quote(part) { if (!/^[A-Za-z_][A-Za-z0-9_$]*$/.test(part)) throw new Error('Schema must be a simple SQL identifier.'); return dialect === 'mysql' ? '`' + part + '`' : dialect === 'mssql' ? '[' + part + ']' : '"' + part + '"'; }
+    return (schema ? quote(schema) + '.' : '') + quote(name);
+  }
+  function sql(result, schema = '', dialect = 'postgres') {
+    const ledger = table('subledger', schema, dialect), history = table('subledgerbalancehistory', schema, dialect);
+    const lines = ['-- Review warnings. Run in a transaction in DBX and verify affected rows before COMMIT.', '-- Only loaded history rows are targeted; reload and re-analyze after database changes.'];
+    function textPredicate(column, value) { return value == null ? `${column} IS NULL` : `${column} = '${String(value).replaceAll("'", "''")}'`; }
+    for (const c of result.cleanup) {
+      for (const h of c.remove) lines.push(`DELETE FROM ${history} WHERE clientuid = ${result.scope.client} AND subledgeruid = ${c.row.uid} AND uid = ${h.uid} AND balance = ${decimal(h.balance)} AND basebalance = ${decimal(h.basebalance)} AND balancechange = ${decimal(h.balancechange)} AND ${textPredicate('identityid', h.identityid)};`);
+      if (c.update) lines.push(`UPDATE ${ledger} SET balance = ${decimal(c.first.balance)}, basebalance = ${decimal(c.first.basebalance)} WHERE clientuid = ${result.scope.client} AND uid = ${c.row.uid} AND ${result.scope.type}uid = ${id(c.row[result.scope.type + 'uid'])} AND balance = ${decimal(c.row.balance)} AND basebalance = ${decimal(c.row.basebalance)};`);
+    }
+    if (lines.length === 2) lines.push('-- No corrections needed.');
+    return lines.join('\n');
+  }
+  function select(name, s, schema, dialect, after) {
+    const entity = s.type + 'uid', target = table(name, schema, dialect), ledger = table('subledger', schema, dialect);
+    const fields = name === 'subledger' ? ['uid', 'clientuid', entity, 'referencenumber', 'crossreferencenumber', 'amount', 'balance', 'basebalance', 'description', 'journaldate'] : ['uid', 'clientuid', 'subledgeruid', 'identityid', 'balance', 'basebalance', 'balancechange'];
+    const cast = dialect === 'mysql' ? 'CHAR' : 'VARCHAR(100)';
+    const numeric = new Set(['uid', 'clientuid', entity, 'subledgeruid', 'identityid', 'referencenumber', 'crossreferencenumber', 'amount', 'balance', 'basebalance', 'balancechange']);
+    const columns = fields.map(k => numeric.has(k) ? `CAST(${k} AS ${cast}) AS ${k}` : k).join(', ');
+    const filter = name === 'subledger' ? `${entity} IN (${s.entities.join(',')})` : `subledgeruid IN (SELECT uid FROM ${ledger} WHERE clientuid = ${s.client} AND ${entity} IN (${s.entities.join(',')}))`;
+    // Qualify the source column: ORDER BY uid would resolve to the text-cast output alias.
+    return `SELECT ${columns} FROM ${target} AS dbx_row WHERE clientuid = ${s.client} AND ${filter}${after ? ' AND dbx_row.uid > ' + id(after) : ''} ORDER BY dbx_row.uid`;
+  }
+  async function load(query, request, name, s, schema, dialect, progress) {
+    const rows = []; let after;
+    let columns;
+    for (;;) {
+      const page = await query({ ...request, sql: select(name, s, schema, dialect, after), maxRows: 5000, timeoutMs: 60000 });
+      const normalized = normalize(page, ['uid']);
+      if (columns && JSON.stringify(columns) !== JSON.stringify(page.columns)) throw new Error('Columns changed during loading. Reload the data.');
+      columns = page.columns;
+      for (const row of normalized) {
+        const current = id(row.uid);
+        if (after !== undefined && BigInt(current) <= BigInt(after)) throw new Error('Unordered or duplicate UID during paging.');
+        after = current;
+      }
+      rows.push(...page.rows); progress(`${name}: loaded ${rows.length} rows…`);
+      if (!page.truncated) return { columns, rows };
+      if (!normalized.length) throw new Error('Host truncated the result without returning rows. Use complete CSV exports.');
+    }
+  }
+  function recoveryPlan(input) {
+    if (input.dialect !== 'postgres') throw new Error('Full-table snapshots currently support PostgreSQL only.');
+    if (typeof input.database !== 'string' || !input.database.trim()) throw new Error('Enter the database name before preparing snapshot or restore SQL.');
+    if (typeof input.schema !== 'string' || !input.schema.trim()) throw new Error('Enter the tables’ schema (usually public) before preparing snapshot or restore SQL.');
+    if (typeof input.token !== 'string' || !/^[a-z0-9_]{1,32}$/.test(input.token)) throw new Error('Snapshot ID must contain 1–32 lowercase letters, digits or underscores.');
+    const schema = input.schema.trim();
+    table('subledger', schema, 'postgres');
+    return { format: 'dbx-subledger-recovery', version: 1, dialect: 'postgres', database: input.database.trim(), schema, token: input.token };
+  }
+  function readRecoveryPlan(text) {
+    const plan = JSON.parse(text);
+    if (!plan || plan.format !== 'dbx-subledger-recovery' || plan.version !== 1) throw new Error('Unsupported recovery plan format or version.');
+    return recoveryPlan(plan);
+  }
+  function snapshotCheckSql(input) {
+    const p = recoveryPlan(input);
+    const target = name => table(name, p.schema, 'postgres');
+    return `SELECT format_version, database_name, schema_name, CAST(captured_at AS TEXT) AS captured_at,
+      CAST(ledger_rows AS TEXT) AS ledger_rows, CAST(history_rows AS TEXT) AS history_rows,
+      CAST((SELECT count(*) FROM ${target('dbx_sl_' + p.token)}) AS TEXT) AS actual_ledger_rows,
+      CAST((SELECT count(*) FROM ${target('dbx_sbh_' + p.token)}) AS TEXT) AS actual_history_rows,
+      current_database() AS current_database FROM ${target('dbx_snap_' + p.token)}`;
+  }
+  function snapshotSql(input, mode) {
+    const plan = recoveryPlan(input);
+    if (!['create', 'restore'].includes(mode)) throw new Error('Invalid snapshot operation.');
+    const target = name => table(name, plan.schema, 'postgres');
+    const ledger = target('subledger'), history = target('subledgerbalancehistory');
+    const ledgerBackup = target('dbx_sl_' + plan.token), historyBackup = target('dbx_sbh_' + plan.token), meta = target('dbx_snap_' + plan.token);
+    // E literals escape quotes and backslashes; the DO delimiter is chosen after constructing the body.
+    const literal = value => "E'" + String(value).replaceAll('\\', '\\\\').replaceAll("'", "''") + "'";
+    const relation = name => `${literal(name)}::regclass`;
+    function structure(name) {
+      return `(SELECT jsonb_agg(jsonb_build_object('name', a.attname, 'type', a.atttypid, 'typmod', a.atttypmod, 'collation', a.attcollation, 'nullable', NOT a.attnotnull, 'identity', a.attidentity, 'generated', a.attgenerated, 'expression', pg_get_expr(d.adbin, d.adrelid)) ORDER BY a.attnum)
+      FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+      WHERE a.attrelid = ${relation(name)} AND a.attnum > 0 AND NOT a.attisdropped)`;
+    }
+    const validateKeys = name => `  IF EXISTS (SELECT 1 FROM ${name} GROUP BY clientuid, uid HAVING count(*) > 1 OR clientuid IS NULL OR uid IS NULL) THEN
+    RAISE EXCEPTION 'Snapshot recovery requires unique non-null (clientuid, uid) keys in both tables.';
+  END IF;`;
+    const preamble = `  SET LOCAL lock_timeout = '10s';
+  SET LOCAL row_security = off;
+  SET LOCAL search_path = pg_catalog;
+  IF current_database() IS DISTINCT FROM ${literal(plan.database)} THEN
+    RAISE EXCEPTION 'Wrong database. Open the database recorded in the recovery plan.';
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_class WHERE oid IN (${relation(ledger)}, ${relation(history)}) AND relkind <> 'r') OR EXISTS (SELECT 1 FROM pg_inherits WHERE inhparent IN (${relation(ledger)}, ${relation(history)}) OR inhrelid IN (${relation(ledger)}, ${relation(history)})) THEN
+    RAISE EXCEPTION 'Snapshots require ordinary PostgreSQL tables without partitions or inheritance.';
+  END IF;`;
+    let declarations = '', body;
+    if (mode === 'create') {
+      body = `${preamble}
+  LOCK TABLE ${ledger}, ${history} IN SHARE MODE;
+  -- CREATE without IF NOT EXISTS refuses to overwrite an existing snapshot.
+${validateKeys(ledger)}
+${validateKeys(history)}
+  CREATE TABLE ${ledgerBackup} AS TABLE ${ledger};
+  CREATE TABLE ${historyBackup} AS TABLE ${history};
+  CREATE TABLE ${meta} AS SELECT
+    1::integer AS format_version, current_database()::text AS database_name,
+    ${literal(plan.schema)}::text AS schema_name, clock_timestamp() AS captured_at,
+    ${relation(ledger)}::oid AS ledger_oid, ${relation(history)}::oid AS history_oid,
+    ${structure(ledger)} AS ledger_structure, ${structure(history)} AS history_structure,
+    (SELECT count(*) FROM ${ledgerBackup}) AS ledger_rows,
+    (SELECT count(*) FROM ${historyBackup}) AS history_rows;
+  RAISE NOTICE 'Snapshot created successfully. Keep the backup tables and recovery plan.';`;
+    } else {
+      declarations = 'DECLARE\n  saved record;\n  ledger_columns text;\n  history_columns text;\n  ledger_updates text;\n  history_updates text;\n';
+      const writableColumns = name => `(SELECT string_agg(quote_ident(attname), ', ' ORDER BY attnum) FROM pg_attribute WHERE attrelid = ${relation(name)} AND attnum > 0 AND NOT attisdropped AND attgenerated = '')`;
+      const updateColumns = name => `(SELECT string_agg(format('%I = b.%I', attname, attname), ', ' ORDER BY attnum) FROM pg_attribute WHERE attrelid = ${relation(name)} AND attnum > 0 AND NOT attisdropped AND attgenerated = '' AND attname NOT IN ('uid', 'clientuid'))`;
+      const verify = (name, backup) => `EXISTS ((SELECT to_jsonb(t) FROM ${name} t EXCEPT ALL SELECT to_jsonb(b) FROM ${backup} b) UNION ALL (SELECT to_jsonb(b) FROM ${backup} b EXCEPT ALL SELECT to_jsonb(t) FROM ${name} t))`;
+      body = `${preamble}
+  LOCK TABLE ${ledger}, ${history} IN ACCESS EXCLUSIVE MODE;
+  LOCK TABLE ${meta}, ${ledgerBackup}, ${historyBackup} IN SHARE MODE;
+  SELECT * INTO STRICT saved FROM ${meta};
+  IF saved.format_version IS DISTINCT FROM 1 OR saved.database_name IS DISTINCT FROM current_database() OR saved.schema_name IS DISTINCT FROM ${literal(plan.schema)}
+     OR saved.ledger_oid IS DISTINCT FROM ${relation(ledger)}::oid OR saved.history_oid IS DISTINCT FROM ${relation(history)}::oid THEN
+    RAISE EXCEPTION 'Snapshot belongs to different tables or a different database.';
+  END IF;
+  IF saved.ledger_structure IS DISTINCT FROM ${structure(ledger)} OR saved.history_structure IS DISTINCT FROM ${structure(history)} THEN
+    RAISE EXCEPTION 'Table definitions changed since the snapshot. Restore aborted without modifying rows.';
+  END IF;
+  IF saved.ledger_rows IS DISTINCT FROM (SELECT count(*) FROM ${ledgerBackup}) OR saved.history_rows IS DISTINCT FROM (SELECT count(*) FROM ${historyBackup}) THEN
+    RAISE EXCEPTION 'Snapshot row counts do not match. Restore aborted.';
+  END IF;
+${validateKeys(ledger)}
+${validateKeys(history)}
+${validateKeys(ledgerBackup)}
+${validateKeys(historyBackup)}
+  IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid IN (${relation(ledger)}, ${relation(history)}) AND attnum > 0 AND NOT attisdropped AND attidentity <> '' AND attname NOT IN ('uid', 'clientuid')) THEN
+    RAISE EXCEPTION 'Identity columns outside the row keys require a custom recovery script.';
+  END IF;
+  ledger_columns := ${writableColumns(ledger)};
+  history_columns := ${writableColumns(history)};
+  SET CONSTRAINTS ALL DEFERRED;
+  ledger_updates := ${updateColumns(ledger)};
+  history_updates := ${updateColumns(history)};
+  -- Remove only rows absent from capture, children first. Keep existing rows and their references.
+  DELETE FROM ${history} t WHERE NOT EXISTS (SELECT 1 FROM ${historyBackup} b WHERE b.uid = t.uid AND b.clientuid = t.clientuid);
+  IF ledger_updates IS NOT NULL THEN
+    EXECUTE 'UPDATE ${ledger} t SET ' || ledger_updates || ' FROM ${ledgerBackup} b WHERE b.uid = t.uid AND b.clientuid = t.clientuid AND to_jsonb(t) IS DISTINCT FROM to_jsonb(b)';
+  END IF;
+  EXECUTE 'INSERT INTO ${ledger} (' || ledger_columns || ') OVERRIDING SYSTEM VALUE SELECT ' || ledger_columns || ' FROM ${ledgerBackup} b WHERE NOT EXISTS (SELECT 1 FROM ${ledger} t WHERE t.uid = b.uid AND t.clientuid = b.clientuid)';
+  IF history_updates IS NOT NULL THEN
+    EXECUTE 'UPDATE ${history} t SET ' || history_updates || ' FROM ${historyBackup} b WHERE b.uid = t.uid AND b.clientuid = t.clientuid AND to_jsonb(t) IS DISTINCT FROM to_jsonb(b)';
+  END IF;
+  EXECUTE 'INSERT INTO ${history} (' || history_columns || ') OVERRIDING SYSTEM VALUE SELECT ' || history_columns || ' FROM ${historyBackup} b WHERE NOT EXISTS (SELECT 1 FROM ${history} t WHERE t.uid = b.uid AND t.clientuid = b.clientuid)';
+  DELETE FROM ${ledger} t WHERE NOT EXISTS (SELECT 1 FROM ${ledgerBackup} b WHERE b.uid = t.uid AND b.clientuid = t.clientuid);
+  SET CONSTRAINTS ALL IMMEDIATE;
+  -- Compare every column and duplicate count, including values affected by triggers/generated expressions.
+  IF ${verify(ledger, ledgerBackup)} OR ${verify(history, historyBackup)} THEN
+    RAISE EXCEPTION 'Restored rows differ from the snapshot. All restore changes have been rolled back.';
+  END IF;
+  RAISE NOTICE 'Both tables restored and verified. Backup tables have been retained.';`;
+    }
+    let delimiter = '$dbx_snapshot_0$';
+    for (let n = 1; body.includes(delimiter) || declarations.includes(delimiter); n++) delimiter = `$dbx_snapshot_${n}$`;
+    return `-- ${mode === 'create' ? 'CREATE FULL-TABLE SNAPSHOT' : 'RESTORE BOTH FULL TABLES'}: ${plan.token}
+-- Database: ${JSON.stringify(plan.database)}; schema: ${plan.schema}.
+-- Covers ALL clients and entities. ${mode === 'restore' ? 'Replaces ALL rows in both tables, including removal of rows added since capture.' : 'Copies ALL columns and rows into persistent backup tables.'}
+-- Run this entire DO statement in DBX. It is atomic; any error rolls back the whole operation.
+-- Run with autocommit enabled; inside an existing transaction, commit only after successful verification.
+-- Requires PostgreSQL 12+. Keep backup tables and the saved recovery plan until recovery is no longer needed.
+DO ${delimiter}
+${declarations}BEGIN
+${body}
+END;
+${delimiter};`;
+  }
+  return { id, ids, decimal, csv, normalize, scope, analyze, sql, select, load, recoveryPlan, readRecoveryPlan, snapshotSql, snapshotCheckSql };
+})();
+</script>
+<script>
+const $ = id => document.getElementById(id);
+let current, busy = false, revision = 0, snapshotPrepared = null;
+function status(message, error = false) { $('status').textContent = message; $('status').dataset.error = String(error); }
+function invalidate() { revision++; current = null; $('results').hidden = true; $('sql').value = ''; clearSnapshotPreview(); }
+function source() { const live = $('source').value === 'live'; $('liveFields').hidden = !live; $('csvFields').hidden = live; $('connection').required = live; }
+$('source').addEventListener('change', source);
+$('form').addEventListener('input', invalidate);
+$('form').addEventListener('change', invalidate);
+function context(ctx) {
+  invalidate();
+  newSnapshotId();
+  $('connection').value = ctx.connectionId || ctx.id || '';
+  $('database').value = ctx.database || ''; $('schema').value = ctx.schema || '';
+  const dialect = { postgresql: 'postgres', postgres: 'postgres', sqlserver: 'mssql', mssql: 'mssql', mysql: 'mysql', mariadb: 'mysql', sqlite: 'sqlite' }[ctx.dbType];
+  if (dialect) $('dialect').value = dialect;
+}
+if (window.dbxPlugin) {
+  window.dbxPlugin.ready.then(ctx => { context(ctx || {}); window.dbxPlugin.onContext(context); }).catch(e => status(e.message, true));
+} else { $('source').value = 'csv'; }
+source();
+$('form').addEventListener('submit', async e => {
+  e.preventDefault(); if (busy) return;
+  invalidate(); const version = revision; busy = true; $('analyze').disabled = true;
+  try {
+    const input = { client: $('client').value, entities: $('entities').value, seeds: $('seeds').value, type: $('type').value };
+    const s = Subledger.scope(input), schema = $('schema').value.trim(), dialect = $('dialect').value;
+    let ledger, history;
+    if ($('source').value === 'csv') {
+      const a = $('ledgerFile').files[0], b = $('historyFile').files[0];
+      if (!a || !b) throw new Error('Choose both CSV files.');
+      [ledger, history] = await Promise.all([a.text().then(Subledger.csv), b.text().then(Subledger.csv)]);
+    } else {
+      if (!window.dbxPlugin?.capabilities.dataApi) throw new Error('This host does not support live data queries. Use CSV exports.');
+      const request = { connectionId: $('connection').value.trim(), database: $('database').value.trim() || undefined, schema: schema || undefined };
+      ledger = await Subledger.load(r => window.dbxPlugin.queryData(r), request, 'subledger', s, schema, dialect, status);
+      history = await Subledger.load(r => window.dbxPlugin.queryData(r), request, 'subledgerbalancehistory', s, schema, dialect, status);
+    }
+    if (version !== revision) throw new Error('Inputs or connection changed during loading. Analyze again.');
+    const analysis = Subledger.analyze(ledger, history, input);
+    const sql = Subledger.sql(analysis, schema, dialect);
+    const deletes = analysis.cleanup.reduce((n, c) => n + c.remove.length, 0), updates = analysis.cleanup.filter(c => c.update).length;
+    $('summary').textContent = `${analysis.connected.length} connected subledgers; ${analysis.identities.length} identity IDs (${analysis.identities.join(', ') || 'none'}). ${deletes} history rows to delete; ${updates} balances to restore.`;
+    $('warnings').replaceChildren(...analysis.warnings.map(w => { const li = document.createElement('li'); li.textContent = w; return li; }));
+    $('rows').replaceChildren(...analysis.connected.map(row => {
+      const tr = document.createElement('tr');
+      for (const key of ['uid', input.type + 'uid', 'referencenumber', 'crossreferencenumber', 'amount', 'balance', 'description', 'journaldate']) { const td = document.createElement('td'); td.textContent = row[key] ?? '—'; tr.append(td); }
+      return tr;
+    }));
+    $('sql').value = sql; current = analysis; $('results').hidden = false;
+    status('Analysis complete. Review the correction SQL below.');
+  } catch (error) { invalidate(); status(error.message, true); }
+  finally { busy = false; $('analyze').disabled = false; }
+});
+async function copy(text) {
+  try {
+    if (window.dbxPlugin) await window.dbxPlugin.request('host.copy', { text });
+    else await navigator.clipboard.writeText(text);
+    status('Copied to clipboard.');
+  } catch (e) { status('Copy failed. Select and copy the SQL text manually. ' + e.message, true); }
+}
+$('copyUids').addEventListener('click', () => { if (current) copy(current.connected.map(r => r.uid).join(',')); });
+$('copySql').addEventListener('click', () => { if (current) copy($('sql').value); });
+function clearSnapshotPreview() {
+  snapshotPrepared = null;
+  $('snapshotPreview').hidden = true;
+  $('snapshotSql').value = '';
+  $('snapshotInfo').textContent = '';
+}
+function newSnapshotId() {
+  revision++;
+  clearSnapshotPreview();
+  const random = crypto.getRandomValues(new Uint32Array(1))[0].toString(16).padStart(8, '0');
+  $('snapshotToken').value = 's' + new Date().toISOString().replace(/\D/g, '').slice(0, 14) + '_' + random;
+}
+function planFromForm() {
+  if ($('source').value !== 'live') throw new Error('Snapshots operate on database tables. Select Open DBX connection first.');
+  if (!$('connection').value.trim()) throw new Error('Open the plugin from the database menu to select a connection.');
+  return Subledger.recoveryPlan({ dialect: $('dialect').value, database: $('database').value, schema: $('schema').value, token: $('snapshotToken').value });
+}
+function prepareSnapshot(mode) {
+  clearSnapshotPreview();
+  try {
+    const plan = planFromForm();
+    const sql = Subledger.snapshotSql(plan, mode);
+    snapshotPrepared = { plan, mode, sql };
+    $('snapshotSql').value = sql;
+    $('snapshotOperation').textContent = mode === 'create'
+      ? 'Create snapshot: copy and execute this entire statement in DBX. Only a successful execution creates the snapshot.'
+      : 'Restore: executing this statement replaces ALL rows in both tables, for ALL clients, with the saved snapshot. Rows added since capture will be removed.';
+    $('snapshotInfo').textContent = `Recovery plan: ${plan.database}.${plan.schema}; snapshot ID: ${plan.token}.`;
+    $('snapshotPreview').hidden = false;
+  } catch (e) { status(e.message, true); }
+}
+async function saveFile(name, text, contentType) {
+  if (window.dbxPlugin?.saveFile) {
+    const result = await window.dbxPlugin.saveFile({ fileName: name, contentType }, new TextEncoder().encode(text));
+    if (result == null || result?.cancelled || result?.canceled) return false;
+  } else if (!window.dbxPlugin) {
+    const url = URL.createObjectURL(new Blob([text], { type: contentType }));
+    const link = document.createElement('a'); link.href = url; link.download = name; link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } else throw new Error('File saving is unavailable on this host. Copy and save the SQL from the preview.');
+  return true;
+}
+$('newSnapshot').addEventListener('click', newSnapshotId);
+$('snapshotToken').addEventListener('input', () => { revision++; clearSnapshotPreview(); });
+$('prepareSnapshot').addEventListener('click', () => prepareSnapshot('create'));
+$('prepareRestore').addEventListener('click', () => prepareSnapshot('restore'));
+$('checkSnapshot').addEventListener('click', async () => {
+  const version = revision;
+  $('checkSnapshot').disabled = true;
+  try {
+    const plan = planFromForm();
+    if (!window.dbxPlugin?.capabilities.dataApi) throw new Error('This host does not support snapshot verification queries.');
+    const page = await window.dbxPlugin.queryData({ connectionId: $('connection').value.trim(), database: plan.database, schema: plan.schema, sql: Subledger.snapshotCheckSql(plan), maxRows: 2, timeoutMs: 60000 });
+    if (version !== revision) throw new Error('Inputs or connection changed during verification. Check the snapshot again.');
+    const rows = Subledger.normalize(page, ['format_version', 'database_name', 'schema_name', 'captured_at', 'ledger_rows', 'history_rows', 'actual_ledger_rows', 'actual_history_rows', 'current_database']);
+    if (page.truncated || rows.length !== 1) throw new Error('Snapshot metadata is missing or invalid.');
+    const row = rows[0];
+    if (String(row.format_version) !== '1' || row.database_name !== plan.database || row.current_database !== plan.database || row.schema_name !== plan.schema) throw new Error('Snapshot belongs to a different database or schema.');
+    if (Subledger.id(row.ledger_rows) !== Subledger.id(row.actual_ledger_rows) || Subledger.id(row.history_rows) !== Subledger.id(row.actual_history_rows)) throw new Error('Snapshot backup row counts do not match its metadata.');
+    $('snapshotInfo').textContent = `Snapshot ${plan.token} exists, captured ${row.captured_at}: ${row.ledger_rows} subledger rows and ${row.history_rows} history rows. Counts match. Restore will also check table definitions and verify restored values.`;
+    status('Snapshot exists and its backup row counts match the capture metadata.');
+  } catch (e) { status(e.message + ' If capture has not been run, execute the prepared snapshot SQL in DBX first.', true); }
+  finally { $('checkSnapshot').disabled = false; }
+});
+$('copySnapshotSql').addEventListener('click', () => { if (snapshotPrepared) copy(snapshotPrepared.sql); });
+$('saveSnapshotSql').addEventListener('click', async () => {
+  if (!snapshotPrepared) return;
+  const prepared = snapshotPrepared;
+  try {
+    if (await saveFile(`subledger-${prepared.plan.token}-${prepared.mode}.sql`, prepared.sql, 'text/plain')) status('SQL file saved. Execute it in DBX to perform the operation.');
+  } catch (e) { status(e.message, true); }
+});
+$('savePlan').addEventListener('click', async () => {
+  try {
+    const plan = planFromForm();
+    if (await saveFile(`subledger-${plan.token}-recovery.json`, JSON.stringify(plan, null, 2), 'application/json')) status('Recovery plan saved. It contains no row data; the snapshot exists only after its create SQL succeeds in DBX.');
+  } catch (e) { status(e.message, true); }
+});
+$('loadPlan').addEventListener('change', async () => {
+  const file = $('loadPlan').files[0]; if (!file) return;
+  const version = revision;
+  try {
+    if (file.size > 16384) throw new Error('Recovery plan is too large. Select a saved recovery JSON file.');
+    const plan = Subledger.readRecoveryPlan(await file.text());
+    if (version !== revision) throw new Error('Connection or inputs changed while loading the recovery plan. Load it again.');
+    invalidate();
+    $('database').value = plan.database; $('schema').value = plan.schema;
+    $('dialect').value = plan.dialect; $('snapshotToken').value = plan.token;
+    $('source').value = 'live'; source();
+    $('snapshotInfo').textContent = `Loaded plan for ${plan.database}.${plan.schema}, snapshot ${plan.token}. Check the selected connection, then prepare restore SQL.`;
+    status('Recovery plan loaded. No database changes have been made.');
+  } catch (e) { status(e.message, true); }
+  finally { $('loadPlan').value = ''; }
+});
+newSnapshotId();
+</script>
+</main></body></html>

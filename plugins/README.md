@@ -439,7 +439,7 @@ The `context.result` snapshot is bounded — `{ columns, rows (<= 500), truncate
 
 ### `context-menu`
 
-A context-menu entry is rendered **natively** by DBX (no sandbox iframe, native theme and keyboard behavior) in the declared menu surface. v1 supports the saved-connection and table menus in the Sidebar Tree. Object Browser integration is not part of the first table contribution surface.
+A context-menu entry is rendered **natively** by DBX (no sandbox iframe, native theme and keyboard behavior) in the declared menu surface. v1 supports the saved-connection, database, and table menus in the Sidebar Tree. Object Browser integration is not part of the first table contribution surface.
 
 ```json
 {
@@ -449,6 +449,8 @@ A context-menu entry is rendered **natively** by DBX (no sandbox iframe, native 
   "menu": "connection"
 }
 ```
+
+For a database-scoped action, declare `menu: "database"`. The host passes `{ connectionId, database, dbType? }` from the selected database node to a declarative workbench, and `{ database: { connectionId, database, dbType? } }` to a backend action. The database comes from the node's canonical metadata, independently of the connection's default database and the displayed label. Reopening a workbench refreshes this context. This target requires a DBX build that supports database context menus.
 
 For a table-scoped action, declare `menu: "table"`:
 

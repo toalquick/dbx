@@ -1434,9 +1434,9 @@ fn validate_contributions(
             PluginContribution::ContextMenu(menu) => {
                 validate_required_text(&menu.label, &format!("Context menu '{id}' label"), errors);
                 validate_declared_icon(plugin_dir, &format!("Context menu '{id}' icon"), menu.icon.as_deref(), errors);
-                if menu.menu != "connection" && menu.menu != "table" {
+                if menu.menu != "connection" && menu.menu != "database" && menu.menu != "table" {
                     errors.push(format!(
-                        "Context menu '{id}' declares unsupported menu '{}'; only 'connection' and 'table' are available",
+                        "Context menu '{id}' declares unsupported menu '{}'; only 'connection', 'database' and 'table' are available",
                         menu.menu
                     ));
                 }
@@ -2636,8 +2636,8 @@ mod tests {
     }
 
     #[test]
-    fn accepts_connection_and_table_context_menu_targets() -> Result<(), Box<dyn std::error::Error>> {
-        for menu in ["connection", "table"] {
+    fn accepts_connection_database_and_table_context_menu_targets() -> Result<(), Box<dyn std::error::Error>> {
+        for menu in ["connection", "database", "table"] {
             let (dir, manifest) = context_menu_manifest(menu)?;
             let compatibility = manifest.compatibility(dir.path(), "0.1.0");
             assert!(compatibility.compatible, "{menu}: {:?}", compatibility.errors);
@@ -2764,7 +2764,7 @@ mod tests {
         let compatibility = manifest.compatibility(dir.path(), "0.1.0");
         assert!(!compatibility.compatible);
         assert!(compatibility.errors.iter().any(|error| {
-            error == "Context menu 'io.dbx.example.inspect' declares unsupported menu 'schema'; only 'connection' and 'table' are available"
+            error == "Context menu 'io.dbx.example.inspect' declares unsupported menu 'schema'; only 'connection', 'database' and 'table' are available"
         }));
         Ok(())
     }
@@ -2831,7 +2831,7 @@ mod tests {
             .map(|value| value.as_str().unwrap().to_string())
             .collect::<Vec<_>>();
 
-        assert_eq!(declared, ["connection", "table"]);
+        assert_eq!(declared, ["connection", "database", "table"]);
         assert_eq!(
             schema["$defs"]["contextMenuContribution"]["properties"]["action"]["$ref"],
             "#/$defs/contextMenuAction"

@@ -1,0 +1,17 @@
+{
+  "$schema": "../../plugins/manifest.schema.json",
+  "manifest_version": 1,
+  "id": "dlsoftware.subledger-finder",
+  "name": "Subledger Finder",
+  "version": "1.0.3",
+  "publisher": "DL Software",
+  "description": "Find connected customer or supplier subledgers and prepare balance history correction SQL.",
+  "permissions": ["host.data:read"],
+  "engines": { "dbx": ">=0.6.44", "host_api": "^1.4" },
+  "entrypoints": { "ui": { "root": "ui", "entry": "ui/index.html" } },
+  "contributions": [
+    { "type": "workbench", "id": "dlsoftware.subledger-finder.main", "label": "Subledger Finder" },
+    { "type": "context-menu", "id": "dlsoftware.subledger-finder.database", "label": "Troubleshoot subledgers", "menu": "database", "action": { "type": "open-workbench", "workbench": "dlsoftware.subledger-finder.main" } },
+    { "type": "context-menu", "id": "dlsoftware.subledger-finder.table", "label": "Troubleshoot subledgers", "menu": "table", "action": { "type": "open-workbench", "workbench": "dlsoftware.subledger-finder.main" } }
+  ]
+}

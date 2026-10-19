@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ConnectionConfig, PluginContextMenuContribution, TreeNode } from "@/types/database";
-import { activatePluginContextMenuItem, buildPluginConnectionContextMenuInvocation, buildPluginTableContext, buildPluginTableContextMenuInvocation, type PluginContextMenuActivationHandlers } from "./pluginContext";
+import { activatePluginContextMenuItem, buildPluginConnectionContextMenuInvocation, buildPluginDatabaseContextMenuInvocation, buildPluginTableContext, buildPluginTableContextMenuInvocation, type PluginContextMenuActivationHandlers } from "./pluginContext";
 
 function tableNode(overrides: Partial<TreeNode> = {}): TreeNode {
   return {
@@ -27,7 +27,7 @@ function activationHandlers(overrides: Partial<PluginContextMenuActivationHandle
 
 const pluginId = "com.example.plugin";
 
-function openWorkbenchContribution(menu: "connection" | "table"): PluginContextMenuContribution {
+function openWorkbenchContribution(menu: "connection" | "database" | "table"): PluginContextMenuContribution {
   return {
     type: "context-menu",
     id: "example.open",
@@ -38,6 +38,33 @@ function openWorkbenchContribution(menu: "connection" | "table"): PluginContextM
 }
 
 describe("plugin context menu context", () => {
+  it("opens the selected database with its parent connection, independent of defaults and labels", async () => {
+    const connection: ConnectionConfig = { id: "conn-1", db_type: "postgres", name: "Flex", database: "default-db", host: "db.internal", port: 5432, username: "user", password: "test-secret" };
+    const node = { type: "database", connectionId: "conn-1", database: "quick3_no_007", label: "Display only" } as TreeNode;
+    const invocation = buildPluginDatabaseContextMenuInvocation("example.open", node, connection)!;
+    expect(invocation.context).toEqual({ connectionId: "conn-1", database: "quick3_no_007", dbType: "postgres" });
+    expect(invocation.params).toEqual({ database: invocation.context });
+    expect(JSON.stringify(invocation)).not.toContain("test-secret");
+    const openWorkbench = vi.fn();
+    const invokePlugin = vi.fn();
+    await activatePluginContextMenuItem(pluginId, openWorkbenchContribution("database"), invocation, activationHandlers({ openWorkbench, invokePlugin }));
+    expect(openWorkbench).toHaveBeenCalledWith(pluginId, "example.main", {
+      title: "Open Example",
+      connectionId: "conn-1",
+      context: invocation.context,
+      refreshContextOnReuse: true,
+    });
+    expect(invokePlugin).not.toHaveBeenCalled();
+  });
+
+  it("rejects database menu contexts without canonical connection and database identity", () => {
+    const node = { type: "database", connectionId: "conn-1", database: "app" } as TreeNode;
+    expect(buildPluginDatabaseContextMenuInvocation("example.open", { ...node, type: "schema" })).toBeNull();
+    expect(buildPluginDatabaseContextMenuInvocation("example.open", { ...node, database: undefined })).toBeNull();
+    expect(buildPluginDatabaseContextMenuInvocation("example.open", { ...node, connectionId: " " })).toBeNull();
+    expect(buildPluginDatabaseContextMenuInvocation(" ", node)).toBeNull();
+  });
+
   it("builds the public table context from canonical table metadata", () => {
     expect(buildPluginTableContext(tableNode())).toEqual({
       connectionId: "conn-1",

@@ -571,7 +571,13 @@ export interface PluginFilesystemMutationResult {
   entry?: PluginFilesystemEntry;
 }
 
-export type PluginContextMenuTarget = "connection" | "table";
+export type PluginContextMenuTarget = "connection" | "database" | "table";
+
+export interface PluginDatabaseContext {
+  connectionId: string;
+  database: string;
+  dbType?: string;
+}
 
 export interface PluginTableContext {
   connectionId: string;

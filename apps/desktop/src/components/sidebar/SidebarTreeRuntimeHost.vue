@@ -82,7 +82,7 @@ import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { savedSqlErrorMessage } from "@/lib/savedSql/savedSqlErrors";
 import { useToast } from "@/composables/useToast";
 import { createFrontendPluginRegistry } from "@/lib/plugins/frontendPlugin";
-import { activatePluginContextMenuItem, buildPluginConnectionContextMenuInvocation, buildPluginTableContextMenuInvocation } from "@/lib/plugins/pluginContext";
+import { activatePluginContextMenuItem, buildPluginConnectionContextMenuInvocation, buildPluginDatabaseContextMenuInvocation, buildPluginTableContextMenuInvocation } from "@/lib/plugins/pluginContext";
 import { parseDynamicMenuResponse, renderDynamicMenuEntries, type DynamicMenuAction } from "@/lib/plugins/dynamicContextMenu";
 import type { PluginContextMenuInvocation } from "@/lib/plugins/pluginContext";
 import type { InstalledPlugin, PluginContextMenuContribution, PluginWorkbenchContribution } from "@/types/database";
@@ -7870,6 +7870,24 @@ function appendPluginConnectionMenuItems(items: ContextMenuItem[], node: TreeNod
   items.push({ label: "", separator: true }, ...menuItems);
 }
 
+/** Plugin-contributed native menu entries scoped to the selected database. */
+function appendPluginDatabaseMenuItems(items: ContextMenuItem[], node: TreeNode) {
+  if (node.type !== "database") return;
+  const config = node.connectionId ? connectionStore.getConfig(node.connectionId) : undefined;
+  const databaseItems: ContextMenuItem[] = [];
+  for (const { plugin, contribution } of sidebarPluginRegistry.value.listContextMenuItems("database")) {
+    if (contribution.dynamic) continue;
+    const invocation = buildPluginDatabaseContextMenuInvocation(contribution.id, node, config);
+    if (!invocation) continue;
+    databaseItems.push({
+      label: contribution.label,
+      icon: PlugZap,
+      action: () => activateSidebarPluginContextMenuItem(plugin.manifest.id, contribution, invocation),
+    });
+  }
+  if (databaseItems.length) items.push({ label: "", separator: true }, ...databaseItems);
+}
+
 /** Plugin-contributed native menu entries for canonical table nodes. */
 function appendPluginTableMenuItems(items: ContextMenuItem[], node: TreeNode) {
   if (node.type !== "table") return;
@@ -7893,12 +7911,12 @@ function appendPluginTableMenuItems(items: ContextMenuItem[], node: TreeNode) {
 
 /** Resolve opt-in contributions only for the row being opened. A failing plugin cannot hold the menu open. */
 function resolveContextMenu(node: TreeNode, staticItems: ContextMenuItem[]): Promise<ContextMenuItem[]> | ContextMenuItem[] {
-  if (node.type !== "connection" && node.type !== "table") return staticItems;
+  if (node.type !== "connection" && node.type !== "database" && node.type !== "table") return staticItems;
   const entries = sidebarPluginRegistry.value.listContextMenuItems(node.type).filter(({ contribution }) => contribution.dynamic);
   if (entries.length === 0) return staticItems;
   const requests = entries.map(async ({ plugin, contribution }) => {
-    const invocation = node.type === "connection" ? (node.connectionId ? connectionStore.getConfig(node.connectionId) : undefined) : undefined;
-    const target = node.type === "connection" ? (invocation ? buildPluginConnectionContextMenuInvocation(contribution.id, invocation) : null) : buildPluginTableContextMenuInvocation(contribution.id, node);
+    const config = node.connectionId ? connectionStore.getConfig(node.connectionId) : undefined;
+    const target = node.type === "connection" ? (config ? buildPluginConnectionContextMenuInvocation(contribution.id, config) : null) : node.type === "database" ? buildPluginDatabaseContextMenuInvocation(contribution.id, node, config) : buildPluginTableContextMenuInvocation(contribution.id, node);
     if (!target) return [];
     try {
       const ownerPluginId = node.type === "connection" && node.connectionId ? connectionStore.getConfig(node.connectionId)?.plugin_id : undefined;
@@ -8041,6 +8059,7 @@ function buildContextMenu(node: TreeNode): ContextMenuItem[] {
   let rawItems: ContextMenuItem[];
   try {
     rawItems = treeItemMenuItems();
+    appendPluginDatabaseMenuItems(rawItems, node);
   } finally {
     acceptedSelectionIds = null;
   }

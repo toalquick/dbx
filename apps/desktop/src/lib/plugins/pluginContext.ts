@@ -1,4 +1,4 @@
-import type { ConnectionConfig, PluginContextMenuContribution, PluginTableContext, TreeNode } from "@/types/database";
+import type { ConnectionConfig, PluginContextMenuContribution, PluginDatabaseContext, PluginTableContext, TreeNode } from "@/types/database";
 import type { PluginWorkbenchContext } from "./pluginHostBridge";
 
 export type PluginTableContextNode = Pick<TreeNode, "type" | "connectionId" | "database" | "schema" | "tableName">;
@@ -10,7 +10,7 @@ interface PluginContextMenuConnectionContext {
   database: string;
 }
 
-type PluginContextMenuBackendParams = { connection: PluginContextMenuConnectionContext } | { table: PluginTableContext };
+type PluginContextMenuBackendParams = { connection: PluginContextMenuConnectionContext } | { database: PluginDatabaseContext } | { table: PluginTableContext };
 
 export interface PluginContextMenuInvocation {
   method: string;
@@ -31,6 +31,22 @@ export interface PluginContextMenuActivationHandlers {
 function nonEmptyContextValue(value: string | undefined): string | undefined {
   const normalized = value?.trim();
   return normalized || undefined;
+}
+
+/** Use the selected database's canonical identity, never the connection's default database or row label. */
+export function buildPluginDatabaseContextMenuInvocation(contributionId: string, node: Pick<TreeNode, "type" | "connectionId" | "database">, connection?: Pick<ConnectionConfig, "db_type">): PluginContextMenuInvocation | null {
+  if (!contributionId.trim() || node.type !== "database") return null;
+  const connectionId = nonEmptyContextValue(node.connectionId);
+  const database = nonEmptyContextValue(node.database);
+  if (!connectionId || !database) return null;
+  const context: PluginDatabaseContext = { connectionId, database };
+  if (connection?.db_type) context.dbType = connection.db_type;
+  return {
+    method: `contextMenu/${contributionId}`,
+    params: { database: context },
+    context: { ...context },
+    connectionId,
+  };
 }
 
 /**

@@ -29,7 +29,7 @@ const connection = {
   password: "",
 };
 
-function contextMenuPlugin(id: string, menu: "connection" | "table", label: string): InstalledPlugin {
+function contextMenuPlugin(id: string, menu: "connection" | "database" | "table", label: string): InstalledPlugin {
   return {
     compatibility: { compatible: true },
     manifest: {
@@ -83,6 +83,52 @@ function menuLabels(items: ContextMenuItem[]): string[] {
 }
 
 describe("SidebarTreeRuntimeHost plugin context-menu refresh", () => {
+  it("opens database actions with the right-clicked database and refreshes reused workbench context", async () => {
+    const plugin = contextMenuPlugin("dlsoftware.subledger-finder", "database", "Troubleshoot subledgers");
+    plugin.manifest.contributions!.push({ type: "workbench", id: "dlsoftware.subledger-finder.workbench", label: "Subledger Finder" });
+    listPlugins.mockResolvedValue([plugin]);
+    const { host } = await mountHost();
+    const openWorkbench = vi.spyOn(useQueryStore(), "openPluginWorkbench").mockReturnValue("plugin-tab");
+    const databaseNode = (database: string): TreeNode => ({ id: `conn-1:${database}`, type: "database", label: "Display label", connectionId: "conn-1", database });
+    for (const database of ["quick3_no_007", "quick3_no_008"]) {
+      const items = host.value.buildContextMenu(databaseNode(database));
+      const item = items.find((item) => item.label === "Troubleshoot subledgers");
+      expect(item).toBeDefined();
+      item!.action!();
+      expect(openWorkbench).toHaveBeenLastCalledWith("dlsoftware.subledger-finder", "dlsoftware.subledger-finder.workbench", {
+        title: "Troubleshoot subledgers",
+        connectionId: "conn-1",
+        refreshContextOnReuse: true,
+        context: { connectionId: "conn-1", database, dbType: "mysql" },
+      });
+    }
+    expect(menuLabels(host.value.buildContextMenu(connectionNode()))).not.toContain("Troubleshoot subledgers");
+    expect(menuLabels(host.value.buildContextMenu(tableNode()))).not.toContain("Troubleshoot subledgers");
+    expect(menuLabels(host.value.buildContextMenu({ ...databaseNode("app"), type: "schema" }))).not.toContain("Troubleshoot subledgers");
+    expect(invokePlugin).not.toHaveBeenCalled();
+    openWorkbench.mockRestore();
+  });
+
+  it("resolves dynamic database actions using the selected database scope", async () => {
+    const plugin = contextMenuPlugin("com.example.database", "database", "Database actions");
+    const contribution = plugin.manifest.contributions![0];
+    if (contribution.type === "context-menu") contribution.dynamic = true;
+    listPlugins.mockResolvedValue([plugin]);
+    invokePlugin.mockResolvedValue({ items: [] });
+    const { host } = await mountHost();
+    const node: TreeNode = { id: "conn-1:chosen", type: "database", label: "Display", connectionId: "conn-1", database: "chosen" };
+    await host.value.resolveContextMenu(node, []);
+    expect(invokePlugin).toHaveBeenCalledWith(
+      "com.example.database",
+      "contextMenu/resolve/example.generate",
+      {
+        database: { connectionId: "conn-1", database: "chosen", dbType: "mysql" },
+        locale: expect.any(String),
+      },
+      500,
+    );
+  });
+
   beforeEach(() => {
     listPlugins.mockReset();
     listPlugins.mockResolvedValue([]);

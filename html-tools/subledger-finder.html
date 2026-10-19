@@ -1,0 +1,809 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Connected Subledger Finder</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 30px;
+        }
+        .input-section {
+            margin-bottom: 30px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 6px;
+        }
+        .input-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: 500;
+            color: #555;
+        }
+        input[type="file"],
+        input[type="number"],
+        input[type="text"],
+        select {
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            width: 100%;
+            max-width: 400px;
+        }
+        button {
+            background: #007bff;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            margin-top: 10px;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .results {
+            margin-top: 30px;
+        }
+        .result-section {
+            margin-bottom: 20px;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 6px;
+            border: 1px solid #e0e0e0;
+        }
+        .result-section h3 {
+            margin-top: 0;
+            color: #333;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+        th, td {
+            text-align: left;
+            padding: 8px;
+            border-bottom: 1px solid #ddd;
+        }
+        th {
+            background: #f0f0f0;
+            font-weight: 600;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+        }
+        .status.info {
+            background: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+        .status.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .export-btn {
+            background: #28a745;
+            margin-top: 20px;
+        }
+        .export-btn:hover {
+            background: #218838;
+        }
+        pre {
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 12px;
+            line-height: 1.5;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Connected Subledger Finder</h1>
+        <p style="color: #666; margin-bottom: 30px;">Find all connected customer or supplier subledgers based on reference numbers and identity IDs. You can search across multiple customers/suppliers at once.</p>
+        
+        <div class="input-section">
+            <h2>Upload Files and Set Parameters</h2>
+            <p style="color: #666; font-size: 14px; margin-bottom: 20px;">Export CSV files containing all subledger data for specific customers OR suppliers</p>
+            
+            <div class="input-group">
+                <label for="subledgerFile">Subledger CSV File:</label>
+                <input type="file" id="subledgerFile" accept=".csv">
+            </div>
+            
+            <div class="input-group">
+                <label for="balanceHistoryFile">Subledger Balance History CSV File:</label>
+                <input type="file" id="balanceHistoryFile" accept=".csv">
+            </div>
+            
+            <div class="input-group">
+                <label for="subledgerType">Subledger Type:</label>
+                <select id="subledgerType" onchange="updateTypeLabel()">
+                    <option value="customer">Customer</option>
+                    <option value="supplier">Supplier</option>
+                </select>
+            </div>
+            
+            <div class="input-group">
+                <label for="entityuid" id="entityLabel">Customer UIDs (comma-separated):</label>
+                <input type="text" id="entityuid" placeholder="e.g., 12345, 67890">
+            </div>
+            
+            <div class="input-group">
+                <label for="initialSubledgeruid">Initial Subledger UIDs (comma-separated, or * for all):</label>
+                <input type="text" id="initialSubledgeruid" placeholder="e.g., 12345, 67890 or *">
+            </div>
+            
+            <button id="findConnected" onclick="findConnectedSubledgers()">Find Connected Subledgers</button>
+        </div>
+        
+        <div id="status"></div>
+        <div id="results" class="results"></div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.0/papaparse.min.js"></script>
+    <script>
+        let subledgerData = null;
+        let balanceHistoryData = null;
+
+        function updateTypeLabel() {
+            const type = document.getElementById('subledgerType').value;
+            const label = document.getElementById('entityLabel');
+            const input = document.getElementById('entityuid');
+            
+            if (type === 'customer') {
+                label.textContent = 'Customer UIDs (comma-separated):';
+                input.placeholder = 'e.g., 12345, 67890';
+            } else {
+                label.textContent = 'Supplier UIDs (comma-separated):';
+                input.placeholder = 'e.g., 12345, 67890';
+            }
+        }
+
+        // File upload handlers
+        document.getElementById('subledgerFile').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (file) {
+                Papa.parse(file, {
+                    header: true,
+                    dynamicTyping: true,
+                    skipEmptyLines: true,
+                    complete: function(results) {
+                        subledgerData = results.data;
+                        showStatus('Subledger file loaded: ' + results.data.length + ' rows', 'info');
+                        
+                        // Check if required columns exist
+                        if (results.data.length > 0) {
+                            const hasCustomerUid = 'customeruid' in results.data[0];
+                            const hasSupplierUid = 'supplieruid' in results.data[0];
+                            if (!hasCustomerUid && !hasSupplierUid) {
+                                showStatus('Warning: No customeruid or supplieruid column found in subledger file', 'error');
+                            }
+                        }
+                    },
+                    error: function(error) {
+                        showStatus('Error loading subledger file: ' + error.message, 'error');
+                    }
+                });
+            }
+        });
+
+        document.getElementById('balanceHistoryFile').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (file) {
+                Papa.parse(file, {
+                    header: true,
+                    dynamicTyping: true,
+                    skipEmptyLines: true,
+                    complete: function(results) {
+                        balanceHistoryData = results.data;
+                        showStatus('Balance history file loaded: ' + results.data.length + ' rows', 'info');
+                    },
+                    error: function(error) {
+                        showStatus('Error loading balance history file: ' + error.message, 'error');
+                    }
+                });
+            }
+        });
+
+        function showStatus(message, type = 'info') {
+            const statusDiv = document.getElementById('status');
+            statusDiv.innerHTML = `<div class="status ${type}">${message}</div>`;
+        }
+
+        function findConnectedSubledgers() {
+            // Validate inputs
+            if (!subledgerData || !balanceHistoryData) {
+                showStatus('Please upload both CSV files first', 'error');
+                return;
+            }
+
+            const entityuidsStr = document.getElementById('entityuid').value;
+            const subledgerType = document.getElementById('subledgerType').value;
+            const initialSubledgeruidsStr = document.getElementById('initialSubledgeruid').value;
+
+            if (!entityuidsStr || !initialSubledgeruidsStr) {
+                showStatus('Please enter all required parameters', 'error');
+                return;
+            }
+
+            // Parse multiple entity UIDs
+            const entityuids = entityuidsStr
+                .split(',')
+                .map(uid => parseInt(uid.trim()))
+                .filter(uid => !isNaN(uid));
+
+            if (entityuids.length === 0) {
+                showStatus(`Please enter at least one valid ${subledgerType} UID`, 'error');
+                return;
+            }
+
+            // Auto-detect clientuid from the data
+            const clientuids = [...new Set(subledgerData.map(row => row.clientuid).filter(uid => uid != null))];
+            if (clientuids.length === 0) {
+                showStatus('No clientuid found in the subledger data', 'error');
+                return;
+            }
+            if (clientuids.length > 1) {
+                showStatus(`Multiple clientuids found in data: ${clientuids.join(', ')}. Please ensure only one client's data is uploaded.`, 'error');
+                return;
+            }
+            const clientuid = clientuids[0];
+
+            // Filter data for the specific client and customer/supplier
+            const filteredSubledgers = subledgerData.filter(row => {
+                if (subledgerType === 'customer') {
+                    return row.clientuid === clientuid && entityuids.includes(row.customeruid);
+                } else {
+                    return row.clientuid === clientuid && entityuids.includes(row.supplieruid);
+                }
+            });
+            
+            const filteredBalanceHistory = balanceHistoryData.filter(row => 
+                row.clientuid === clientuid
+            );
+
+            // Check if the selected type matches the data
+            if (filteredSubledgers.length === 0) {
+                const alternateType = subledgerType === 'customer' ? 'supplier' : 'customer';
+                const alternateField = subledgerType === 'customer' ? 'supplieruid' : 'customeruid';
+                const hasAlternateData = subledgerData.some(row => 
+                    row.clientuid === clientuid && entityuids.includes(row[alternateField])
+                );
+                
+                if (hasAlternateData) {
+                    showStatus(`No ${subledgerType} subledgers found with the given UIDs. Did you mean to select ${alternateType} type?`, 'error');
+                } else {
+                    showStatus(`No ${subledgerType} subledgers found with the given UIDs`, 'error');
+                }
+                document.getElementById('results').innerHTML = '';
+                return;
+            }
+
+            // Handle "*" to process all subledgers for the specified customer/supplier
+            let initialSubledgeruids;
+            if (initialSubledgeruidsStr.trim() === '*') {
+                initialSubledgeruids = filteredSubledgers.map(s => s.uid);
+                showStatus(`Processing all ${initialSubledgeruids.length} subledgers for ${subledgerType}(s): ${entityuids.join(', ')}...`, 'info');
+            } else {
+                // Parse multiple initial subledger UIDs
+                initialSubledgeruids = initialSubledgeruidsStr
+                    .split(',')
+                    .map(uid => parseInt(uid.trim()))
+                    .filter(uid => !isNaN(uid));
+
+                if (initialSubledgeruids.length === 0) {
+                    showStatus('Please enter at least one valid subledger UID or use * for all', 'error');
+                    return;
+                }
+
+                showStatus(`Finding connected ${subledgerType} subledgers for ${initialSubledgeruids.length} initial UID(s) across ${entityuids.length} ${subledgerType}(s)...`, 'info');
+            }
+
+            // Find all connected subledgers (or all if "*" was specified)
+            const connectedSubledgers = new Map();
+            
+            if (initialSubledgeruidsStr.trim() === '*') {
+                // When "*" is specified, process ALL subledgers for the given customer/supplier UIDs
+                filteredSubledgers.forEach(s => {
+                    connectedSubledgers.set(s.uid, s);
+                });
+            } else {
+                // Normal connected subledger finding logic
+                const processedSubledgers = new Set();
+                const toProcess = [...initialSubledgeruids];
+
+                while (toProcess.length > 0) {
+                    const currentUid = toProcess.pop();
+                    
+                    if (processedSubledgers.has(currentUid)) {
+                        continue;
+                    }
+                    
+                    processedSubledgers.add(currentUid);
+
+                    // Find the current subledger
+                    const currentSubledger = filteredSubledgers.find(s => s.uid === currentUid);
+                    
+                    if (!currentSubledger) {
+                        continue;
+                    }
+
+                    connectedSubledgers.set(currentUid, currentSubledger);
+
+                    // Find subledgers connected by reference numbers
+                    const refNum = currentSubledger.referencenumber;
+                    const crossRefNum = currentSubledger.crossreferencenumber;
+                    
+                    // Find matches by reference number
+                    if (refNum) {
+                        const matches = filteredSubledgers.filter(s => 
+                            (s.referencenumber === refNum || s.crossreferencenumber === refNum) &&
+                            !processedSubledgers.has(s.uid)
+                        );
+                        matches.forEach(m => toProcess.push(m.uid));
+                    }
+                    
+                    // Find matches by cross reference number
+                    if (crossRefNum) {
+                        const matches = filteredSubledgers.filter(s => 
+                            (s.referencenumber === crossRefNum || s.crossreferencenumber === crossRefNum) &&
+                            !processedSubledgers.has(s.uid)
+                        );
+                        matches.forEach(m => toProcess.push(m.uid));
+                    }
+                }
+
+                // Find identity IDs from balance history
+                const identityIds = new Set();
+                for (const [uid, subledger] of connectedSubledgers) {
+                    const balanceRecords = filteredBalanceHistory.filter(b => b.subledgeruid === uid);
+                    balanceRecords.forEach(b => {
+                        if (b.identityid) {
+                            identityIds.add(b.identityid);
+                        }
+                    });
+                }
+
+                // Find additional subledgers with same identity IDs
+                const additionalSubledgerUids = new Set();
+                for (const identityId of identityIds) {
+                    const relatedBalanceRecords = filteredBalanceHistory.filter(b => b.identityid === identityId);
+                    relatedBalanceRecords.forEach(b => {
+                        if (b.subledgeruid && !connectedSubledgers.has(b.subledgeruid)) {
+                            additionalSubledgerUids.add(b.subledgeruid);
+                        }
+                    });
+                }
+
+                // Process additional subledgers found through identity IDs
+                const toProcessIdentity = Array.from(additionalSubledgerUids);
+                while (toProcessIdentity.length > 0) {
+                    const currentUid = toProcessIdentity.pop();
+                    
+                    if (processedSubledgers.has(currentUid)) {
+                        continue;
+                    }
+                    
+                    processedSubledgers.add(currentUid);
+
+                    const currentSubledger = filteredSubledgers.find(s => s.uid === currentUid);
+                    
+                    if (!currentSubledger) {
+                        continue;
+                    }
+
+                    connectedSubledgers.set(currentUid, currentSubledger);
+
+                    // Find subledgers connected by reference numbers
+                    const refNum = currentSubledger.referencenumber;
+                    const crossRefNum = currentSubledger.crossreferencenumber;
+                    
+                    if (refNum) {
+                        const matches = filteredSubledgers.filter(s => 
+                            (s.referencenumber === refNum || s.crossreferencenumber === refNum) &&
+                            !processedSubledgers.has(s.uid)
+                        );
+                        matches.forEach(m => toProcessIdentity.push(m.uid));
+                    }
+                    
+                    if (crossRefNum) {
+                        const matches = filteredSubledgers.filter(s => 
+                            (s.referencenumber === crossRefNum || s.crossreferencenumber === crossRefNum) &&
+                            !processedSubledgers.has(s.uid)
+                        );
+                        matches.forEach(m => toProcessIdentity.push(m.uid));
+                    }
+                }
+            }
+
+            // Find identity IDs from balance history (for display purposes)
+            const identityIds = new Set();
+            for (const [uid, subledger] of connectedSubledgers) {
+                const balanceRecords = filteredBalanceHistory.filter(b => b.subledgeruid === uid);
+                balanceRecords.forEach(b => {
+                    if (b.identityid) {
+                        identityIds.add(b.identityid);
+                    }
+                });
+            }
+
+
+            // Prepare cleanup analysis
+            const cleanupAnalysis = analyzeCleanup(connectedSubledgers, filteredBalanceHistory);
+
+            // Display results
+            displayResults(connectedSubledgers, identityIds, cleanupAnalysis);
+        }
+
+        function analyzeCleanup(connectedSubledgers, balanceHistory) {
+            const cleanupData = [];
+            const warnings = [];
+            
+            for (const [uid, subledger] of connectedSubledgers) {
+                // Find all balance history entries for this subledger
+                const entries = balanceHistory
+                    .filter(b => b.subledgeruid === uid)
+                    .sort((a, b) => a.uid - b.uid); // Sort by UID to find the first entry
+                
+                if (entries.length === 0) {
+                    warnings.push({
+                        type: 'no_history',
+                        subledgeruid: uid,
+                        message: `Subledger ${uid} has no balance history entries`
+                    });
+                    continue;
+                }
+                
+                const firstEntry = entries[0];
+                const entriesToDelete = entries.slice(1);
+                
+                // Check warnings
+                if (firstEntry.identityid !== null && firstEntry.identityid !== undefined && firstEntry.identityid !== 0) {
+                    warnings.push({
+                        type: 'identityid_not_null',
+                        subledgeruid: uid,
+                        identityid: firstEntry.identityid,
+                        message: `First entry for subledger ${uid} has non-null identityid: ${firstEntry.identityid}`
+                    });
+                }
+                
+                if (firstEntry.balancechange !== firstEntry.balance) {
+                    warnings.push({
+                        type: 'balance_mismatch',
+                        subledgeruid: uid,
+                        balancechange: firstEntry.balancechange,
+                        balance: firstEntry.balance,
+                        message: `First entry for subledger ${uid}: balancechange (${firstEntry.balancechange}) != balance (${firstEntry.balance})`
+                    });
+                }
+                
+                if (firstEntry.balance !== subledger.amount) {
+                    warnings.push({
+                        type: 'amount_mismatch',
+                        subledgeruid: uid,
+                        newBalance: firstEntry.balance,
+                        currentAmount: subledger.amount,
+                        message: `Subledger ${uid}: new balance (${firstEntry.balance}) != current amount (${subledger.amount})`
+                    });
+                }
+                
+                cleanupData.push({
+                    subledgeruid: uid,
+                    firstEntryUid: firstEntry.uid,
+                    entriesToDelete: entriesToDelete.map(e => e.uid),
+                    deleteCount: entriesToDelete.length,
+                    newBalance: firstEntry.balance,
+                    newBaseBalance: firstEntry.basebalance,
+                    currentBalance: subledger.balance,
+                    currentBaseBalance: subledger.basebalance
+                });
+            }
+            
+            return { cleanupData, warnings };
+        }
+
+        function displayResults(connectedSubledgers, identityIds, cleanupAnalysis) {
+            const resultsDiv = document.getElementById('results');
+            resultsDiv.innerHTML = '';
+
+            if (connectedSubledgers.size === 0) {
+                showStatus('No connected subledgers found', 'info');
+                return;
+            }
+
+            showStatus(`Found ${connectedSubledgers.size} connected subledgers`, 'success');
+
+            const subledgerType = document.getElementById('subledgerType').value;
+            const entityuids = document.getElementById('entityuid').value
+                .split(',')
+                .map(uid => parseInt(uid.trim()))
+                .filter(uid => !isNaN(uid));
+
+            // Summary section
+            const summaryHtml = `
+                <div class="result-section">
+                    <h3>Summary</h3>
+                    <p><strong>Type:</strong> ${subledgerType.charAt(0).toUpperCase() + subledgerType.slice(1)} Subledgers</p>
+                    <p><strong>${subledgerType.charAt(0).toUpperCase() + subledgerType.slice(1)} UIDs searched:</strong> ${entityuids.join(', ')}</p>
+                    <p><strong>Total Connected Subledgers:</strong> ${connectedSubledgers.size}</p>
+                    <p><strong>Unique Identity IDs:</strong> ${identityIds.size}</p>
+                    <p><strong>Identity IDs:</strong> ${Array.from(identityIds).join(', ') || 'None found'}</p>
+                </div>
+            `;
+
+            // Connected subledgers table
+            const subledgerArray = Array.from(connectedSubledgers.values());
+            const tableHtml = `
+                <div class="result-section">
+                    <h3>Connected ${subledgerType.charAt(0).toUpperCase() + subledgerType.slice(1)} Subledgers</h3>
+                    <div style="overflow-x: auto;">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>UID</th>
+                                    <th>${subledgerType.charAt(0).toUpperCase() + subledgerType.slice(1)} UID</th>
+                                    <th>Reference Number</th>
+                                    <th>Cross Reference Number</th>
+                                    <th>Amount</th>
+                                    <th>Balance</th>
+                                    <th>Description</th>
+                                    <th>Journal Date</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${subledgerArray.map(s => `
+                                    <tr>
+                                        <td>${s.uid}</td>
+                                        <td>${subledgerType === 'customer' ? s.customeruid : s.supplieruid}</td>
+                                        <td>${s.referencenumber || '-'}</td>
+                                        <td>${s.crossreferencenumber || '-'}</td>
+                                        <td>${s.amount || 0}</td>
+                                        <td>${s.balance || 0}</td>
+                                        <td>${s.description || '-'}</td>
+                                        <td>${s.journaldate || '-'}</td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>
+                    </div>
+                    <button class="export-btn" onclick="copyUidsToClipboard(${JSON.stringify(Array.from(connectedSubledgers.keys()))})">
+                        Copy UIDs to Clipboard
+                    </button>
+                </div>
+            `;
+
+            // Cleanup analysis section
+            let cleanupHtml = '';
+            if (cleanupAnalysis) {
+                // Warnings section
+                if (cleanupAnalysis.warnings.length > 0) {
+                    cleanupHtml += `
+                        <div class="result-section" style="border-color: #ffc107; background: #fff3cd;">
+                            <h3 style="color: #856404;">⚠️ Warnings (${cleanupAnalysis.warnings.length})</h3>
+                            <ul style="margin: 0; padding-left: 20px;">
+                                ${cleanupAnalysis.warnings.map(w => `<li>${w.message}</li>`).join('')}
+                            </ul>
+                        </div>
+                    `;
+                }
+
+                // Cleanup summary
+                const totalDeletes = cleanupAnalysis.cleanupData.reduce((sum, c) => sum + c.deleteCount, 0);
+                const subledgersToUpdate = cleanupAnalysis.cleanupData.filter(c => 
+                    c.newBalance !== c.currentBalance || c.newBaseBalance !== c.currentBaseBalance
+                ).length;
+
+                cleanupHtml += `
+                    <div class="result-section">
+                        <h3>Cleanup Summary</h3>
+                        <p><strong>${subledgerType.charAt(0).toUpperCase() + subledgerType.slice(1)} subledgers to process:</strong> ${cleanupAnalysis.cleanupData.length}</p>
+                        <p><strong>Balance history entries to delete:</strong> ${totalDeletes}</p>
+                        <p><strong>Subledgers requiring balance update:</strong> ${subledgersToUpdate}</p>
+                    </div>
+                `;
+
+                // Generate SQL statements
+                let deleteStatement = '';
+                const deleteConditions = [];
+                const updateStatements = [];
+
+                // Build a single DELETE statement with all conditions
+                cleanupAnalysis.cleanupData.forEach(cleanup => {
+                    if (cleanup.deleteCount > 0) {
+                        deleteConditions.push(
+                            `(subledgeruid = ${cleanup.subledgeruid} AND uid != ${cleanup.firstEntryUid})`
+                        );
+                    }
+
+                    // Update statements for subledger balances
+                    if (cleanup.newBalance !== cleanup.currentBalance || cleanup.newBaseBalance !== cleanup.currentBaseBalance) {
+                        updateStatements.push(
+                            `UPDATE subledger SET balance = ${cleanup.newBalance || 0}, basebalance = ${cleanup.newBaseBalance || 0} WHERE uid = ${cleanup.subledgeruid};`
+                        );
+                    }
+                });
+
+                // Create the single DELETE statement
+                if (deleteConditions.length > 0) {
+                    deleteStatement = `DELETE FROM subledgerbalancehistory 
+WHERE ${deleteConditions.join('\n   OR ')};`;
+                }
+
+                cleanupHtml += `
+                    <div class="result-section">
+                        <h3>SQL Statements for Cleanup</h3>
+                        <div style="margin-bottom: 20px;">
+                            <h4>1. Delete Balance History Entries (${deleteConditions.length} subledgers)</h4>
+                            <button class="export-btn" onclick="copySqlToClipboard('delete')">
+                                Copy DELETE Statement
+                            </button>
+                            <pre id="deleteStatements" style="background: #f5f5f5; padding: 10px; border-radius: 4px; overflow-x: auto; margin-top: 10px; max-height: 200px; overflow-y: auto;">
+${deleteStatement || 'No deletions needed'}</pre>
+                        </div>
+                        <div>
+                            <h4>2. Update Subledger Balances (${updateStatements.length} statements)</h4>
+                            <button class="export-btn" onclick="copySqlToClipboard('update')">
+                                Copy UPDATE Statements
+                            </button>
+                            <pre id="updateStatements" style="background: #f5f5f5; padding: 10px; border-radius: 4px; overflow-x: auto; margin-top: 10px; max-height: 200px; overflow-y: auto;">
+${updateStatements.join('\n') || 'No updates needed'}</pre>
+                        </div>
+                    </div>
+                `;
+            }
+
+            resultsDiv.innerHTML = summaryHtml + cleanupHtml;
+        }
+
+        function copyUidsToClipboard(uidList) {
+            const uidText = uidList.join(',');
+            
+            // Try modern Clipboard API first (works better with large strings)
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(uidText)
+                    .then(() => {
+                        showStatus(`Copied ${uidList.length} UIDs to clipboard! You can now paste them in DBeaver.`, 'success');
+                    })
+                    .catch(err => {
+                        console.error('Clipboard API failed, trying fallback:', err);
+                        fallbackCopyUids(uidText, uidList.length);
+                    });
+            } else {
+                // Fallback for older browsers
+                fallbackCopyUids(uidText, uidList.length);
+            }
+        }
+        
+        function fallbackCopyUids(uidText, count) {
+            // Create a temporary textarea element
+            const textarea = document.createElement('textarea');
+            textarea.value = uidText;
+            textarea.style.position = 'fixed';
+            textarea.style.left = '-999999px';
+            textarea.style.top = '-999999px';
+            document.body.appendChild(textarea);
+            
+            // Select and copy the text
+            textarea.focus();
+            textarea.select();
+            
+            try {
+                const successful = document.execCommand('copy');
+                if (successful) {
+                    showStatus(`Copied ${count} UIDs to clipboard! You can now paste them in DBeaver.`, 'success');
+                } else {
+                    showStatus('Failed to copy to clipboard', 'error');
+                }
+            } catch (err) {
+                showStatus('Failed to copy to clipboard', 'error');
+                console.error('Copy failed:', err);
+            }
+            
+            // Remove the temporary element
+            document.body.removeChild(textarea);
+        }
+
+        function copySqlToClipboard(type) {
+            // Get the SQL text from the appropriate pre element
+            const elementId = type === 'delete' ? 'deleteStatements' : 'updateStatements';
+            const preElement = document.getElementById(elementId);
+            
+            if (!preElement) {
+                showStatus('Could not find SQL statements', 'error');
+                return;
+            }
+            
+            const sqlText = preElement.textContent.trim();
+            
+            if (sqlText === 'No deletions needed' || sqlText === 'No updates needed' || !sqlText) {
+                showStatus(`No ${type} statements to copy`, 'info');
+                return;
+            }
+            
+            // Try modern Clipboard API first (works better with large strings)
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(sqlText)
+                    .then(() => {
+                        if (type === 'delete') {
+                            showStatus(`Copied DELETE statement to clipboard!`, 'success');
+                        } else {
+                            const count = sqlText.split('\n').filter(line => line.trim()).length;
+                            showStatus(`Copied ${count} UPDATE statement${count > 1 ? 's' : ''} to clipboard!`, 'success');
+                        }
+                    })
+                    .catch(err => {
+                        console.error('Clipboard API failed, trying fallback:', err);
+                        fallbackCopy(sqlText, type);
+                    });
+            } else {
+                // Fallback for older browsers
+                fallbackCopy(sqlText, type);
+            }
+        }
+        
+        function fallbackCopy(text, type) {
+            // Create a temporary textarea element
+            const textarea = document.createElement('textarea');
+            textarea.value = text;
+            textarea.style.position = 'fixed';
+            textarea.style.left = '-999999px';
+            textarea.style.top = '-999999px';
+            document.body.appendChild(textarea);
+            
+            // Select and copy the text
+            textarea.focus();
+            textarea.select();
+            
+            try {
+                const successful = document.execCommand('copy');
+                if (successful) {
+                    if (type === 'delete') {
+                        showStatus(`Copied DELETE statement to clipboard!`, 'success');
+                    } else {
+                        const count = text.split('\n').filter(line => line.trim()).length;
+                        showStatus(`Copied ${count} UPDATE statement${count > 1 ? 's' : ''} to clipboard!`, 'success');
+                    }
+                } else {
+                    showStatus('Failed to copy to clipboard. Please copy directly from the text box.', 'error');
+                }
+            } catch (err) {
+                showStatus('Failed to copy to clipboard. Please copy directly from the text box.', 'error');
+                console.error('Copy failed:', err);
+            }
+            
+            // Remove the temporary element
+            document.body.removeChild(textarea);
+        }
+    </script>
+</body>
+</html>

@@ -225,6 +225,13 @@ export function useSqlExecution(deps: {
     return deps.activeTab.value?.id === tabId ? deps.activeTab.value : undefined;
   }
 
+  function updateExecutionTabUiState(tab: QueryTab, patch: Partial<NonNullable<QueryTab["uiState"]>>) {
+    queryStore.updateTabUiState(tab.id, patch);
+    if (!queryStore.tabs.some((candidate) => candidate.id === tab.id)) {
+      tab.uiState = { ...tab.uiState, ...patch };
+    }
+  }
+
   function resolveExecutionConnection(tabId: string | undefined): ConnectionConfig | undefined {
     const tab = resolveExecutionTab(tabId);
     return (tab ? connectionStore.getConfig(tab.connectionId) : undefined) ?? deps.activeConnection.value;
@@ -481,6 +488,7 @@ export function useSqlExecution(deps: {
     if (deps.activeTab.value?.id === executionTabId) {
       deps.activeOutputView.value = redisConsoleSelected ? "result" : statementCount > 1 ? settingsStore.editorSettings.multiStatementDefaultView : "result";
     }
+    updateExecutionTabUiState(tab, { autoSwitchedToMessagesDuringExecution: false });
     const connName = executionConnection?.name || "";
     const start = Date.now();
     const isRedis = executionDatabaseType === "redis";
@@ -499,73 +507,84 @@ export function useSqlExecution(deps: {
       cancelEditorViewportRequest(options.editorViewportRequestId);
       return notStarted("busy", executionTabId);
     }
+    const currentTab = resolveExecutionTab(executionTabId) ?? tab;
     const executionTabStillActive = deps.activeTab.value?.id === executionTabId;
-    const failure = firstQueryExecutionError(tab);
-    const runCancelled = (tab.cancelRequestCount ?? 0) > cancelRequestCountAtStart;
-    const sqlServerMessageResultIndex = executionDatabaseType === "sqlserver" ? tab.results?.findIndex((result) => result.server_message === true) : undefined;
+    const failure = firstQueryExecutionError(currentTab);
+    const runCancelled = (currentTab.cancelRequestCount ?? 0) > cancelRequestCountAtStart;
+    const sqlServerMessageResultIndex = executionDatabaseType === "sqlserver" ? currentTab.results?.findIndex((result) => result.server_message === true) : undefined;
     if (sqlServerMessageResultIndex !== undefined && sqlServerMessageResultIndex >= 0) {
-      focusSqlServerDataResult(tab.id, executionDatabaseType, tab);
+      focusSqlServerDataResult(currentTab.id, executionDatabaseType, currentTab);
       if (executionTabStillActive) {
-        deps.activeOutputView.value = tab.result?.server_message === true ? "messages" : "result";
+        deps.activeOutputView.value = currentTab.result?.server_message === true ? "messages" : "result";
       }
-    } else if (executionDatabaseType === "sqlserver" && tab.result?.server_message === true) {
+    } else if (executionDatabaseType === "sqlserver" && currentTab.result?.server_message === true) {
       if (executionTabStillActive) {
         deps.activeOutputView.value = "messages";
       }
-    } else if (tab.result && !tab.result.columns.length && !tab.results?.some((result) => result.columns.length > 0)) {
+    } else if (currentTab.result && !currentTab.result.columns.length && !currentTab.results?.some((result) => result.columns.length > 0)) {
       if (executionTabStillActive && deps.activeOutputView.value !== "messages") {
-        deps.activeOutputView.value = statementCount === 1 ? defaultViewForResult(tab.result) : "summary";
+        deps.activeOutputView.value = statementCount === 1 ? defaultViewForResult(currentTab.result) : "summary";
       }
-    } else if (failure && !runCancelled && tab.userPinnedOutputViewDuringExecution !== true) {
+    } else if (currentTab.uiState?.autoSwitchedToMessagesDuringExecution) {
+      const hasTabularData =
+        !firstQueryExecutionError(currentTab) &&
+        !!((currentTab.result?.columns.length && currentTab.result.server_message !== true && !isQueryExecutionErrorResult(currentTab.result)) || currentTab.results?.some((result) => result.columns.length > 0 && result.server_message !== true && !isQueryExecutionErrorResult(result)));
+      if (hasTabularData) {
+        const targetView = statementCount > 1 && settingsStore.editorSettings.multiStatementDefaultView === "summary" ? "summary" : "result";
+        updateExecutionTabUiState(currentTab, {
+          activeOutputView: targetView,
+          autoSwitchedToMessagesDuringExecution: false,
+        });
+        if (executionTabStillActive) {
+          deps.activeOutputView.value = targetView;
+        }
+      }
+    } else if (failure && !runCancelled && currentTab.userPinnedOutputViewDuringExecution !== true) {
       // 错误收尾必须落在看得见错误的位置：单语句进结果网格（store 已优先把错误
       // 结果选为活动结果，网格渲染居中错误横幅），多语句进执行摘要（红色错误行）。
-      // 用户中途自己切过视图、或运行是被取消的，都不再抢方向盘。
+      // 用户中途自己切过视图、或运行是被取消的，都不再抢方向盘。执行期间消息页若是
+      // 被 live-output 自动跳转过去的（autoSwitchedToMessagesDuringExecution），上面
+      // upstream 的分支已把链路短路接住：错误留在消息页同样可见（#11822 的规则）。
+      // 旧 mod 38 的"通知先到、数据后到则跳回结果页"分支即由该 upstream 分支取代。
       if (executionTabStillActive) {
         deps.activeOutputView.value = statementCount === 1 ? "result" : "summary";
       }
-    } else if (executionTabStillActive && deps.activeOutputView.value === "messages" && tab.userPinnedOutputViewDuringExecution !== true && ((tab.result?.columns.length ?? 0) > 0 || tab.results?.some((result) => result.columns.length > 0))) {
-      // A notice can arrive before the statement produces its rows, so the live-output watcher
-      // in ContentArea advances to Messages while it cannot yet know that data will follow.
-      // Once the run finishes with a real result set, show the data again; Messages stays one
-      // click away in the view switcher. Message-only runs and SQL Server PRINT batches are
-      // handled by the branches above and keep their existing behavior. The pin guard keeps
-      // a view the user switched to themselves mid-run (mod 38's rule).
-      deps.activeOutputView.value = "result";
     }
     if (failure && !runCancelled && !executionTabStillActive) {
       // The run failed on a tab the user has navigated away from — pull them back
       // with a toast instead of silently updating a background tab.
       const errorText = failure.error ? translateBackendError(t, failure.error, failure.rows?.[0]?.[0]) : String(failure.rows?.[0]?.[0] ?? "");
-      toast(t("tabs.backgroundRunError", { tab: tabDisplayTitle(tab, t), message: (errorText.split("\n")[0] ?? "").trim() || t("common.failed") }), 8000, {
+      toast(t("tabs.backgroundRunError", { tab: tabDisplayTitle(currentTab, t), message: (errorText.split("\n")[0] ?? "").trim() || t("common.failed") }), 8000, {
         label: t("tabs.backgroundRunErrorOpen"),
         onClick: () => {
           void queryStore.activateTab(executionTabId);
         },
       });
     }
+    updateExecutionTabUiState(currentTab, { autoSwitchedToMessagesDuringExecution: false });
     const elapsed = Date.now() - start;
     const success = !failure;
     historyStore.add({
-      connection_id: tab.connectionId,
+      connection_id: currentTab.connectionId,
       connection_name: connName,
-      database: tab.database,
+      database: currentTab.database,
       sql,
       execution_time_ms: elapsed,
       success,
       error: failure ? (failure.error ? translateBackendError(t, failure.error, failure.rows?.[0]?.[0]) : String(failure.rows?.[0]?.[0] ?? "")) : undefined,
       activity_kind: classifySqlActivityKind(sql),
       operation: primarySqlOperation(sql),
-      affected_rows: success ? tab.result?.affected_rows : undefined,
+      affected_rows: success ? currentTab.result?.affected_rows : undefined,
     });
     if (success) {
-      const refreshTarget = sqlMetadataRefreshTarget(sql, tab.schema);
+      const refreshTarget = sqlMetadataRefreshTarget(sql, currentTab.schema);
       if (refreshTarget.scope === "connection") {
-        connectionStore.invalidateMetadataCache(tab.connectionId);
-        await invalidateObjectMetadataCache({ connectionId: tab.connectionId });
-        await connectionStore.loadDatabases(tab.connectionId, { force: true });
+        connectionStore.invalidateMetadataCache(currentTab.connectionId);
+        await invalidateObjectMetadataCache({ connectionId: currentTab.connectionId });
+        await connectionStore.loadDatabases(currentTab.connectionId, { force: true });
       } else if (refreshTarget.scope === "database") {
-        await invalidateObjectMetadataCache({ connectionId: tab.connectionId, database: tab.database, schema: refreshTarget.schema });
-        await connectionStore.refreshObjectListTreeNode(tab.connectionId, tab.database, refreshTarget.schema);
+        await invalidateObjectMetadataCache({ connectionId: currentTab.connectionId, database: currentTab.database, schema: refreshTarget.schema });
+        await connectionStore.refreshObjectListTreeNode(currentTab.connectionId, currentTab.database, refreshTarget.schema);
       }
     }
     return {

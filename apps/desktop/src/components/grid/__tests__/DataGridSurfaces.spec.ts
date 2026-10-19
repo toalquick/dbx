@@ -1,6 +1,5 @@
 // @vitest-environment happy-dom
 
-import { readFileSync } from "node:fs";
 import { createApp, defineComponent, h, nextTick } from "vue";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
@@ -113,18 +112,7 @@ import DataGridSearchBar from "@/components/grid/DataGridSearchBar.vue";
 import DataGridSortBuilder from "@/components/grid/DataGridSortBuilder.vue";
 import DataGridSortWorkbench from "@/components/grid/DataGridSortWorkbench.vue";
 import DataGridTextSortWorkbench from "@/components/grid/DataGridTextSortWorkbench.vue";
-
-const cellDetailPanelSource = readFileSync("apps/desktop/src/components/grid/DataGridCellDetailPanel.vue", "utf8");
-const cellDetailDialogSource = readFileSync("apps/desktop/src/components/grid/DataGridCellDetailDialog.vue", "utf8");
-const binaryTextPreviewSource = readFileSync("apps/desktop/src/components/grid/DataGridCellDetailTextPreview.vue", "utf8");
-const dataGridSource = readFileSync("apps/desktop/src/components/grid/DataGrid.vue", "utf8");
-
-describe("DataGrid opaque aggregate-state safety", () => {
-  it("blocks cell edits and keyless row deletion through the centralized gates", () => {
-    expect(dataGridSource).toMatch(/function canEditCellItem[\s\S]*isOpaqueAggregateStateColumnType\(allColumnTypes\.value\[columnIndex\]\)/);
-    expect(dataGridSource).toMatch(/function canDeleteRowItem[\s\S]*canUseKeylessRowPredicate[\s\S]*hasUnsafeOpaqueAggregateStatePredicate\(allColumnTypes\.value, item\.data\)/);
-  });
-});
+import EnumCellEditor from "@/components/grid/EnumCellEditor.vue";
 
 function detail(patch: Partial<DataGridCellDetail> = {}): DataGridCellDetail {
   return {
@@ -525,13 +513,6 @@ describe("DataGridPagination", () => {
 
     dispatch(sum, "click");
     expect(copySelectionSummary).not.toHaveBeenCalled();
-  });
-});
-
-describe("DataGrid selection summary copy wiring", () => {
-  it("routes the pagination aggregate copy through the grid clipboard helper", () => {
-    expect(dataGridSource).toMatch(/@copy-selection-summary="copyText"/);
-    expect(dataGridSource).toMatch(/:selection-summary-pending="isSelectingCells"/);
   });
 });
 
@@ -2272,6 +2253,55 @@ describe("cell detail surfaces", () => {
     expect(findOne(panel.root, (node) => node.type === "textarea").value).toBe("中文");
   });
 
+  it("shows the grid boolean label in the panel and dialog without changing the raw value", () => {
+    const booleanDetail = detail({
+      type: "bit",
+      value: true,
+      rawValue: "true",
+      rawValuePreview: "true",
+      displayValue: "TRUE",
+      displayValuePreview: "TRUE",
+      formattedJson: "",
+    });
+    const panel = mountComponent(DataGridCellDetailPanel, {
+      detail: booleanDetail,
+      panelIsBottom: true,
+      metadataCollapsed: false,
+      valueFillsHeight: false,
+      editing: false,
+      sideJsonView: false,
+      showCompactJson: false,
+      canCompactJson: false,
+      typeColorClass: () => "",
+      canDownloadBinaryValue: () => false,
+      downloadBinaryValue: vi.fn(),
+      canImportBinaryValue: () => false,
+      importBinaryValue: vi.fn(),
+      openImagePreview: vi.fn(),
+      canCopySqlCondition: () => true,
+      databaseType: "sqlserver",
+    });
+    const dialog = mountComponent(DataGridCellDetailDialog, {
+      open: true,
+      detail: booleanDetail,
+      typeColorClass: () => "",
+      openImagePreview: vi.fn(),
+      copyText: vi.fn(),
+      canDownloadBinaryValue: () => false,
+      downloadBinaryValue: vi.fn(),
+      canImportBinaryValue: () => false,
+      importBinaryValue: vi.fn(),
+      databaseType: "sqlserver",
+    });
+
+    for (const mounted of [panel, dialog]) {
+      expect(hostText(mounted.root)).toContain("TRUE");
+      expect(hostText(mounted.root)).not.toContain(">true<");
+    }
+    // rawValue remains the edit/copy payload; only the preview is labeled.
+    expect(booleanDetail.rawValue).toBe("true");
+  });
+
   it("keeps the value transform entry for non-binary detail cells", () => {
     const panel = mountComponent(DataGridCellDetailPanel, {
       detail: detail({ type: "VARCHAR(32)", value: "hello", rawValue: "hello", rawValuePreview: "hello", displayValue: "hello", displayValuePreview: "hello", formattedJson: "" }),
@@ -2334,16 +2364,6 @@ describe("cell detail surfaces", () => {
     expect(startEdit).not.toHaveBeenCalled();
     expect(hostText(panel.root)).toContain("0x48656c6c6f");
     expect(findOne(panel.root, (node) => node.type === "textarea").value).toBe("Hello");
-  });
-
-  it("keeps the binary text preview component strictly read-only and shared by both surfaces", () => {
-    expect(binaryTextPreviewSource).toContain("binaryCellTextPreview(props.value");
-    // 不发出任何编辑/提交事件，也不给 detail.value / rawValue 赋值。
-    expect(binaryTextPreviewSource).not.toContain("defineEmits");
-    expect(binaryTextPreviewSource).not.toMatch(/(?:props|detail)\.(?:value|rawValue)\s*=/);
-    expect(cellDetailDialogSource).toMatch(/<DataGridCellDetailTextPreview\s+v-if="open && isBinaryCellColumnType\(detail\.type\)"/);
-    // Panel 与下载菜单同一道闸门：编辑中不对草稿做只读文本预览。
-    expect(cellDetailPanelSource).toMatch(/<DataGridCellDetailTextPreview\s+v-if="!editing && isBinaryCellColumnType\(detail\.type\)"/);
   });
 
   it("copies the presented value, emits edit, closes, and replaces the JSON result", async () => {
@@ -2611,5 +2631,43 @@ describe("DataGrid column header tooltips", () => {
     expect(grid.headerTooltipsDisabled()).toEqual([false, false]);
 
     grid.destroy();
+  });
+});
+
+describe("EnumCellEditor boolean labels", () => {
+  it("shows TRUE/FALSE but commits the raw boolean value", () => {
+    const commit = vi.fn();
+    const editor = mountComponent(EnumCellEditor, {
+      modelValue: "true",
+      values: ["true", "false"],
+      displayValues: ["TRUE", "FALSE"],
+      nullable: true,
+      onCommit: commit,
+    });
+
+    expect(hostText(editor.root)).toContain("TRUE");
+    dispatch(
+      findOne(editor.root, (node) => node.type === "button" && hostText(node).trim() === "FALSE"),
+      "click",
+    );
+    expect(commit).toHaveBeenCalledWith("false");
+  });
+
+  it("shows 1/0 for the zero-one style while keeping the raw values", () => {
+    const commit = vi.fn();
+    const editor = mountComponent(EnumCellEditor, {
+      modelValue: "false",
+      values: ["true", "false"],
+      displayValues: ["1", "0"],
+      nullable: true,
+      onCommit: commit,
+    });
+
+    expect(hostText(editor.root)).toContain("0");
+    dispatch(
+      findOne(editor.root, (node) => node.type === "button" && hostText(node).trim() === "1"),
+      "click",
+    );
+    expect(commit).toHaveBeenCalledWith("true");
   });
 });

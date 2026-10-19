@@ -31,7 +31,7 @@ import { ensureReadOnlyWriteAccess } from "@/lib/database/readOnlyWriteAccess";
 import { useProductionSafetyStore } from "@/stores/productionSafetyStore";
 import * as api from "@/lib/backend/api";
 import type { TransferContent, TransferObjectKind, TransferTableNameCase } from "@/lib/backend/api";
-import { crossFamilyTransferableKinds, isSameTransferFamily, isTransferPairSupported, transferObjectKindsForDatabase } from "@/lib/database/transferObjectKinds";
+import { crossFamilyTransferableKinds, isSameTransferFamily, isTransferPairSupported, transferObjectFamily, transferObjectKindsForDatabase } from "@/lib/database/transferObjectKinds";
 import ObjectSelectionTree from "@/components/transfer/ObjectSelectionTree.vue";
 import TransferTaskTree from "@/components/transfer/TransferTaskTree.vue";
 import DataTransferProgressDialog from "@/components/transfer/DataTransferProgressDialog.vue";
@@ -43,6 +43,7 @@ import { transferDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { isDorisFamilyCatalogCapable } from "@/lib/database/databaseFeatureSupport";
 import { decodeTransferDatabaseOption, encodeTransferDatabaseOptions, formatTransferEndpointLabel, isSameTransferDatabase, isTransferDatabaseSelected, normalizeTransferCatalog } from "@/lib/database/dataTransferSelection";
 import { formatDatabaseLabel } from "@/lib/database/defaultDatabase";
+import { DEFAULT_QUERY_TIMEOUT_SECS, MAX_QUERY_TIMEOUT_SECS } from "@/lib/connection/timeoutLimits";
 import { databaseOptionsForConnection, fetchCatalogNamespaceOptions, fetchNamespaceOptionsForConnection, namespaceOptionsAreSchemas } from "@/composables/useDatabaseOptions";
 import { useExportTracker } from "@/composables/useExportTracker";
 import { openDataTransferTask } from "@/composables/useDialogSources";
@@ -85,6 +86,7 @@ const transferDialogStyle = {
 } as const;
 
 const store = useConnectionStore();
+const DEFAULT_TRANSFER_OPERATION_TIMEOUT_SECS = 600;
 
 const sqlConnections = computed(() => store.connections.filter((c) => supportsTransfer(transferDatabaseTypeForConnection(c))));
 const sourceConnections = computed(() => {
@@ -197,7 +199,10 @@ const pendingTargetSchemaPrefill = ref("");
 // Options
 const selectedStrategy = ref<TransferStrategy>("append");
 const targetTableStrategy = computed<TransferStrategy>({
-  get: () => (transferContent.value === "structureOnly" && selectedStrategy.value !== "rebuild" ? "append" : selectedStrategy.value),
+  // Structure-only transfers have no table-data operation, but overwrite is
+  // still meaningful for selected schema objects (for example MySQL routines).
+  // Keep upsert unavailable in this mode while preserving an explicit overwrite.
+  get: () => (transferContent.value === "structureOnly" && (selectedStrategy.value === "upsert" || (selectedStrategy.value === "overwrite" && !structureOverwriteSupported())) ? "append" : selectedStrategy.value),
   set: (value) => {
     selectedStrategy.value = value;
   },
@@ -205,6 +210,8 @@ const targetTableStrategy = computed<TransferStrategy>({
 const targetTableNameCase = ref<TransferTableNameCase>("preserve");
 const quoteTargetColumnNames = ref(true);
 const batchSize = ref(1000);
+const operationTimeoutMode = ref<"inherit" | "custom">("inherit");
+const operationTimeoutSecs = ref(DEFAULT_TRANSFER_OPERATION_TIMEOUT_SECS);
 const showSqlPreviewConfirm = ref(false);
 // Per-source-table filter: table name -> bare WHERE predicate or full SELECT.
 const tableFilters = ref<Record<string, string>>({});
@@ -281,6 +288,12 @@ function requestedTableFilters(): Record<string, string> | undefined {
 const sourceTransferType = computed(() => transferDatabaseTypeForConnection(store.getConfig(sourceConnectionId.value)));
 const targetTransferType = computed(() => transferDatabaseTypeForConnection(store.getConfig(targetConnectionId.value)));
 const isXuguTransferPair = computed(() => sourceTransferType.value === "xugu" && targetTransferType.value === "xugu");
+
+function structureOverwriteSupported(): boolean {
+  if (transferContent.value !== "structureOnly") return true;
+  const hasNonTableObject = Object.entries(selectedObjects.value).some(([kind, names]) => kind !== "TABLE" && (names?.size ?? 0) > 0);
+  return transferObjectFamily(sourceTransferType.value) === "mysql" && transferObjectFamily(targetTransferType.value) === "mysql" && hasNonTableObject;
+}
 // The table-name-case selector is hidden for Xugu pairs; reset any earlier choice so the
 // blocking xuguPreserveTableNames hint cannot strand the user without a visible control.
 watch(isXuguTransferPair, (isXuguPair) => {
@@ -332,6 +345,26 @@ function databaseOptionLabel(connectionId: string, option: string): string {
 
 const sourceDatabaseName = computed(() => decodedDatabase(sourceConnectionId.value, sourceDatabase.value));
 const targetDatabaseName = computed(() => decodedDatabase(targetConnectionId.value, targetDatabase.value));
+const operationTimeoutValid = computed(() => operationTimeoutMode.value === "inherit" || (Number.isInteger(operationTimeoutSecs.value) && operationTimeoutSecs.value >= 0 && operationTimeoutSecs.value <= MAX_QUERY_TIMEOUT_SECS));
+
+function connectionQueryTimeoutSecs(connectionId: string): number {
+  const value = store.getConfig(connectionId)?.query_timeout_secs;
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.round(value) : DEFAULT_QUERY_TIMEOUT_SECS;
+}
+
+function formatOperationTimeout(timeoutSecs: number): string {
+  return timeoutSecs === 0 ? t("transfer.operationTimeoutUnlimited") : t("transfer.operationTimeoutSeconds", { seconds: timeoutSecs });
+}
+
+const operationTimeoutHint = computed(() => {
+  if (operationTimeoutMode.value === "custom") {
+    return operationTimeoutSecs.value === 0 ? t("transfer.operationTimeoutCustomUnlimitedHint") : t("transfer.operationTimeoutCustomHint", { seconds: operationTimeoutSecs.value });
+  }
+  return t("transfer.operationTimeoutInheritedHint", {
+    source: formatOperationTimeout(connectionQueryTimeoutSecs(sourceConnectionId.value)),
+    target: formatOperationTimeout(connectionQueryTimeoutSecs(targetConnectionId.value)),
+  });
+});
 
 const canStart = computed(() => {
   const effectiveSourceSchema = sourceSchema.value || sourceDatabaseName.value;
@@ -353,6 +386,7 @@ const canStart = computed(() => {
     (selectedTables.value.size > 0 || Object.values(selectedObjects.value).some((names) => names.size > 0)) &&
     (targetTableStrategy.value !== "rebuild" || !rebuildDisabledReason.value) &&
     (transferContent.value === "structureOnly" || targetTableStrategy.value !== "upsert" || upsertSupported.value) &&
+    operationTimeoutValid.value &&
     !sameSourceAndTarget
   );
 });
@@ -791,6 +825,8 @@ function resetState(cancelTaskLoad = true) {
   targetTableNameCase.value = "preserve";
   quoteTargetColumnNames.value = true;
   batchSize.value = 1000;
+  operationTimeoutMode.value = "inherit";
+  operationTimeoutSecs.value = DEFAULT_TRANSFER_OPERATION_TIMEOUT_SECS;
   tableFilters.value = {};
   filterDialogOpen.value = false;
   filterEditingTable.value = "";
@@ -912,6 +948,7 @@ async function requestStartTransfer() {
     quoteTargetColumnNames: quoteTargetColumnNames.value,
     ownershipPolicy: "preserve",
     batchSize: batchSize.value,
+    operationTimeoutSecs: operationTimeoutMode.value === "custom" ? operationTimeoutSecs.value : undefined,
     tableFilters: requestedTableFilters(),
     dropTargetConfirmed: false,
   };
@@ -994,6 +1031,7 @@ function currentConfig(): TransferTaskConfig {
     targetTableNameCase: targetTableNameCase.value,
     quoteTargetColumnNames: quoteTargetColumnNames.value,
     batchSize: batchSize.value,
+    operationTimeoutSecs: operationTimeoutMode.value === "custom" && operationTimeoutValid.value ? operationTimeoutSecs.value : undefined,
     tableFilters: requestedTableFilters(),
     dropTargetConfirmed: false,
   };
@@ -1012,7 +1050,7 @@ function configSnapshot(config: TransferTaskConfig) {
 const formHasContent = computed(() => !!sourceConnectionId.value || !!targetConnectionId.value);
 const isConfigDirty = computed(() => !!activeTaskId.value && configSnapshot(currentConfig()) !== savedConfigSnapshot.value);
 const needsDiscardConfirm = computed(() => isConfigDirty.value || (!activeTaskId.value && formHasContent.value));
-const canSaveConfig = computed(() => !!sourceConnectionId.value && isTransferDatabaseSelected(sourceDatabase.value) && !!targetConnectionId.value && isTransferDatabaseSelected(targetDatabase.value));
+const canSaveConfig = computed(() => !!sourceConnectionId.value && isTransferDatabaseSelected(sourceDatabase.value) && !!targetConnectionId.value && isTransferDatabaseSelected(targetDatabase.value) && operationTimeoutValid.value);
 
 // Invalidate before asynchronous callbacks can publish a preview for an old form,
 // including a task switch whose new values happen to equal the previous task.
@@ -1047,6 +1085,8 @@ async function loadTaskIntoForm(task: TransferTask) {
   targetTableNameCase.value = config.targetTableNameCase;
   quoteTargetColumnNames.value = config.quoteTargetColumnNames;
   batchSize.value = config.batchSize;
+  operationTimeoutMode.value = config.operationTimeoutSecs === undefined ? "inherit" : "custom";
+  operationTimeoutSecs.value = config.operationTimeoutSecs ?? DEFAULT_TRANSFER_OPERATION_TIMEOUT_SECS;
   pendingSelectedObjectsPrefill.value = Object.keys(config.objects).length > 0 ? JSON.parse(JSON.stringify(config.objects)) : null;
   pendingTableFiltersPrefill.value = config.tableFilters && Object.keys(config.tableFilters).length > 0 ? { ...config.tableFilters } : null;
 
@@ -1164,7 +1204,10 @@ function onSelectedTaskIdUpdate(id: string | null) {
 // ---- confirmation for the immutable, previewed transfer request ----
 
 function transferStrategyLabel(request: api.TransferRequest): string {
-  if (request.content === "structureOnly") return t(request.dropTargetBeforeCreate ? "transfer.modeRebuildStructure" : "transfer.modeKeepExisting");
+  if (request.content === "structureOnly") {
+    if (request.dropTargetBeforeCreate) return t("transfer.modeRebuildStructure");
+    return t(request.mode === "overwrite" ? "transfer.modeReplaceExisting" : "transfer.modeKeepExisting");
+  }
   const strategy = resolveTransferStrategy(request);
   const keys = { append: "modeAppend", overwrite: "modeOverwrite", upsert: "modeUpsert", rebuild: "modeRebuild" };
   return t(`transfer.${keys[strategy]}`);
@@ -1234,7 +1277,7 @@ const confirmationDetails = computed(() => {
     lines.push(t("transfer.structurePlanSqlPreview"));
 
     const unexpandedObjects = request.objects.filter((selection) => selection.objectType !== "TABLE" && selection.names.length > 0);
-    if (unexpandedObjects.length > 0) {
+    if (unexpandedObjects.length > 0 && !preview.structure.schemaObjectsExpanded) {
       lines.push(t("transfer.structurePreviewUnexpandedObjects", { objects: unexpandedObjects.map((selection) => selection.names.join(", ")).join("; ") }));
     }
     lines.push(t("transfer.structurePreviewRevalidation"));
@@ -1568,7 +1611,7 @@ async function saveConfigTask() {
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="append">{{ t(transferContent === "structureOnly" ? "transfer.modeKeepExisting" : "transfer.modeAppend") }}</SelectItem>
-                    <SelectItem v-if="transferContent !== 'structureOnly'" value="overwrite">{{ t("transfer.modeOverwrite") }}</SelectItem>
+                    <SelectItem v-if="transferContent !== 'structureOnly' || structureOverwriteSupported()" value="overwrite">{{ t(transferContent === "structureOnly" ? "transfer.modeReplaceExisting" : "transfer.modeOverwrite") }}</SelectItem>
                     <SelectItem v-if="transferContent !== 'structureOnly'" value="upsert" :disabled="!upsertSupported">{{ t("transfer.modeUpsert") }}</SelectItem>
                     <SelectItem value="rebuild" :disabled="!!rebuildDisabledReason">{{ t(transferContent === "structureOnly" ? "transfer.modeRebuildStructure" : "transfer.modeRebuild") }}</SelectItem>
                   </SelectContent>
@@ -1596,6 +1639,22 @@ async function saveConfigTask() {
               <div class="flex items-center gap-3">
                 <Label class="text-xs shrink-0">{{ t("transfer.batchSize") }}</Label>
                 <Input v-model.number="batchSize" type="number" min="100" max="10000" step="100" class="h-7 text-xs w-24" />
+              </div>
+              <div class="space-y-1">
+                <div class="flex items-center gap-3">
+                  <Label class="text-xs shrink-0">{{ t("transfer.operationTimeout") }}</Label>
+                  <Select v-model="operationTimeoutMode">
+                    <SelectTrigger class="h-7 w-32 text-xs">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="inherit">{{ t("transfer.operationTimeoutInherit") }}</SelectItem>
+                      <SelectItem value="custom">{{ t("transfer.operationTimeoutCustom") }}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <Input v-if="operationTimeoutMode === 'custom'" v-model.number="operationTimeoutSecs" type="number" min="0" :max="MAX_QUERY_TIMEOUT_SECS" step="1" class="h-7 w-24 text-xs" />
+                </div>
+                <p class="text-xs leading-5 text-muted-foreground">{{ operationTimeoutHint }}</p>
               </div>
             </div>
           </div>

@@ -55,6 +55,7 @@ enum DbxResourceRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[schemars(extend("properties" = {}))]
 pub struct ListConnectionsRequest {}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -3371,6 +3372,9 @@ impl DbxMcpServer {
         if self.plugin_tools_mode.advertise_flat() {
             tools.extend(self.plugin_tools_view(policy.as_ref()).await);
         }
+        for tool in &mut tools {
+            normalize_tool_input_schema(tool);
+        }
         tools
     }
 
@@ -4000,6 +4004,23 @@ impl ServerHandler for DbxMcpServer {
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
         Ok(rmcp::model::ListToolsResult::with_all_items(self.policy_filtered_tools().await))
+    }
+}
+
+/// Ensure object-typed input schemas publish a `properties` object.
+/// OpenAI-compatible gateways (e.g. DashScope / 通义千问, DeepSeek Harness)
+/// strictly validate tool schemas and reject all tool calls if any tool
+/// with `type: "object"` lacks a `properties` map (issue #12464).
+fn normalize_tool_input_schema(tool: &mut rmcp::model::Tool) {
+    let is_object = match tool.input_schema.get("type") {
+        Some(serde_json::Value::String(t)) => t == "object",
+        None => true,
+        _ => false,
+    };
+    if is_object && !tool.input_schema.contains_key("properties") {
+        let mut object = (*tool.input_schema).clone();
+        object.insert("properties".to_string(), serde_json::json!({}));
+        tool.input_schema = std::sync::Arc::new(object);
     }
 }
 
@@ -5093,7 +5114,7 @@ fn format_send_message_result(
         "Message sent to {}.\ntopic: {}\npartition: {}\noffset: {}",
         system_kind.as_str(),
         result.topic,
-        result.partition,
+        result.partition.map(|value| value.to_string()).unwrap_or_else(|| "unknown".into()),
         result.offset
     );
     if let Some(timestamp) = result.timestamp.as_deref() {
@@ -6629,6 +6650,58 @@ mod tests {
     }
 
     #[test]
+    fn all_advertised_tools_publish_properties_in_input_schema() {
+        let server = DbxMcpServer::with_runtime_options(Arc::new(FakeBackend::default()), McpScope::default(), false);
+        let tools = server.tool_router.list_all();
+
+        for tool in &tools {
+            let is_object = match tool.input_schema.get("type") {
+                Some(serde_json::Value::String(t)) => t == "object",
+                None => true,
+                _ => false,
+            };
+            if is_object {
+                assert!(
+                    tool.input_schema.get("properties").and_then(serde_json::Value::as_object).is_some(),
+                    "tool {} inputSchema must publish a 'properties' object for OpenAI compatibility (issue #12464)",
+                    tool.name
+                );
+            }
+        }
+
+        let list_connections = tools
+            .iter()
+            .find(|tool| tool.name == "dbx_list_connections")
+            .expect("dbx_list_connections should be registered");
+        assert_eq!(
+            list_connections.input_schema.get("properties"),
+            Some(&serde_json::json!({})),
+            "dbx_list_connections must have empty properties object"
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_filtered_tools_guarantee_properties_for_all_object_schemas() {
+        let server = DbxMcpServer::with_runtime_options(Arc::new(FakeBackend::default()), McpScope::default(), false);
+        let tools = server.policy_filtered_tools().await;
+
+        for tool in &tools {
+            let is_object = match tool.input_schema.get("type") {
+                Some(serde_json::Value::String(t)) => t == "object",
+                None => true,
+                _ => false,
+            };
+            if is_object {
+                assert!(
+                    tool.input_schema.get("properties").and_then(serde_json::Value::as_object).is_some(),
+                    "advertised tool {} inputSchema must publish 'properties'",
+                    tool.name
+                );
+            }
+        }
+    }
+
+    #[test]
     fn connection_selector_schema_uses_optional_strings() {
         let server = DbxMcpServer::with_runtime_options(Arc::new(FakeBackend::default()), McpScope::default(), false);
         let tools = server.tool_router.list_all();
@@ -6775,10 +6848,22 @@ mod tests {
 
     #[cfg(feature = "mq-admin")]
     #[test]
+    fn format_proxy_send_result_marks_unreported_partition_unknown() {
+        let result: dbx_core::mq::SendMessageResponse = serde_json::from_value(serde_json::json!({
+            "topic": "orders", "offset": 0
+        }))
+        .unwrap();
+        let output = format_send_message_result(&dbx_core::mq::MqSystemKind::RocketMq, &result);
+        assert!(output.contains("partition: unknown"));
+        assert!(!output.contains("partition: 0"));
+    }
+
+    #[cfg(feature = "mq-admin")]
+    #[test]
     fn format_send_message_result_is_concise_and_includes_delivery_metadata() {
         let result = dbx_core::mq::SendMessageResponse {
             topic: "orders".to_string(),
-            partition: 2,
+            partition: Some(2),
             offset: 41,
             timestamp: Some("1700000000000".to_string()),
         };

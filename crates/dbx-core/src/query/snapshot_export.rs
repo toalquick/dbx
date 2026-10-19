@@ -155,9 +155,11 @@ where
                         cancel: &cancel,
                     }))?;
                 cell_file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-                let quoted = json
-                    || request.quote_mode == dbx_formats::csv_export::CsvQuoteMode::All
-                    || csv_needs_quotes(CancelableReader { reader: &mut cell_file, cancel: &cancel })?;
+                let quoted =
+                    json || matches!(
+                        request.quote_mode,
+                        dbx_formats::csv_export::CsvQuoteMode::All | dbx_formats::csv_export::CsvQuoteMode::Strings
+                    ) || csv_needs_quotes(CancelableReader { reader: &mut cell_file, cancel: &cancel })?;
                 cell_file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
                 if quoted {
                     output.write_all(b"\"").map_err(|e| e.to_string())?;
@@ -307,7 +309,8 @@ fn stream_formula_guard(reader: impl Read) -> Result<bool, String> {
             Some(b'.') if !dot && digits > 0 => {
                 dot = true;
                 digits = 0;
-                significant = 0;
+                // Precision is shared across both sides of the decimal point.
+                // Only leading zeros before the first nonzero digit are ignored.
             }
             None => return Ok(digits == 0),
             _ => return Ok(true),
@@ -330,6 +333,14 @@ mod tests {
             "-1.25",
             "-00000000000000000000000000001",
             "-1.00000000000000001",
+            "-123456789012345.6",
+            "-12345678.12345678",
+            "-12345678.01234567",
+            "-12345678.1234567",
+            "-00012345678.1234567",
+            "-0.000000000000000123456789012345",
+            "-0.0000000000000001234567890123456",
+            "-0.00000000000000000000",
             "-2+cmd",
             "-",
             "'-1",
@@ -360,6 +371,10 @@ mod tests {
         for value in [
             format!("{}=cmd", " ".repeat(16385)),
             format!("-{}1", "0".repeat(16385)),
+            format!("-{}12345678.1234567", "0".repeat(8182)),
+            format!("-{}12345678.01234567", "0".repeat(8182)),
+            format!("-0.{}123456789012345", "0".repeat(16385)),
+            format!("-0.{}1234567890123456", "0".repeat(16385)),
             format!("{}中🙂", " ".repeat(16385)),
         ] {
             let mut reader = CountingReader { data: value.as_bytes(), reads: 0 };
@@ -498,6 +513,36 @@ mod tests {
                     &["ID".into(), "PAYLOAD".into()],
                     &[vec![Value::from(1), Value::from(value)]],
                     dbx_formats::csv_export::CsvQuoteMode::Necessary,
+                    Some("\\N")
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn strings_quote_mode_quotes_streamed_text_cells_like_all() {
+        // mod 42：流式大单元格走 quoted 判定时 Strings 与 All 同为「总是加引号」，
+        // 输出必须与 format_query_result_csv_with_options 的 Strings 语义一致。
+        for value in ["plain", "-000000000000000000001", " =cmd", "a,b"] {
+            let mut req = request("csv");
+            req.quote_mode = dbx_formats::csv_export::CsvQuoteMode::Strings;
+            let mut file = tempfile::tempfile().unwrap();
+            write_snapshot_export_with_fetch(req, &mut file, None, |_| {
+                std::future::ready(Ok(serde_json::json!({
+                    "status":"ok","data":value,"next_offset":value.chars().count(),"eof":true,"value_kind":"text"
+                })))
+            })
+            .await
+            .unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            let mut output = String::new();
+            file.read_to_string(&mut output).unwrap();
+            assert_eq!(
+                output,
+                dbx_formats::csv_export::format_query_result_csv_with_options(
+                    &["ID".into(), "PAYLOAD".into()],
+                    &[vec![Value::from(1), Value::from(value)]],
+                    dbx_formats::csv_export::CsvQuoteMode::Strings,
                     Some("\\N")
                 )
             );

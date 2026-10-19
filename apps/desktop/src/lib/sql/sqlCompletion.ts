@@ -1,3 +1,4 @@
+import { collectMysqlRoutineVariables } from "@/lib/sql/mysqlRoutineVariables";
 import { Cassandra, MariaSQL, MSSQL, MySQL, PLSQL, PostgreSQL, SQLite, StandardSQL } from "@codemirror/lang-sql";
 import type { Completion, CompletionInfo } from "@codemirror/autocomplete";
 import type { DatabaseType, SqlSnippet } from "@/types/database";
@@ -219,6 +220,9 @@ const SQL_KEYWORDS = [
   "TEXT",
   "TIME",
   "TIMESTAMP",
+  "TIMESTAMPTZ",
+  "TIMETZ",
+  "INTERVAL",
   "TINYINT",
   "UNIQUEIDENTIFIER",
   "VARBINARY",
@@ -419,6 +423,17 @@ const POSTGRES_SQL_KEYWORDS = [
   "TSQUERY",
   "BYTEA",
   "BOOLEAN",
+  "TIMESTAMPTZ",
+  "TIMETZ",
+  "INTERVAL",
+  "INT2",
+  "INT4",
+  "INT8",
+  "FLOAT4",
+  "FLOAT8",
+  "MONEY",
+  "VARBIT",
+  "DOUBLE PRECISION",
   "RETURNING",
   "ILIKE",
   "SIMILAR TO",
@@ -516,6 +531,8 @@ const DUCKDB_SQL_KEYWORDS = [
   "UNPIVOT",
   "USING SAMPLE",
   "WINDOW",
+  "TIMESTAMPTZ",
+  "INTERVAL",
 ];
 
 const SQLSERVER_SQL_KEYWORDS = [
@@ -717,6 +734,14 @@ const ORACLE_SQL_KEYWORDS = Array.from(
 const DATABASE_SQL_KEYWORDS: Partial<Record<DatabaseType, string[]>> = {
   mysql: MYSQL_SQL_KEYWORDS,
   postgres: POSTGRES_SQL_KEYWORDS,
+  redshift: POSTGRES_SQL_KEYWORDS,
+  gaussdb: POSTGRES_SQL_KEYWORDS,
+  opengauss: POSTGRES_SQL_KEYWORDS,
+  kingbase: POSTGRES_SQL_KEYWORDS,
+  vastbase: POSTGRES_SQL_KEYWORDS,
+  highgo: POSTGRES_SQL_KEYWORDS,
+  uxdb: POSTGRES_SQL_KEYWORDS,
+  sundb: POSTGRES_SQL_KEYWORDS,
   sqlite: SQLITE_SQL_KEYWORDS,
   rqlite: SQLITE_SQL_KEYWORDS,
   turso: SQLITE_SQL_KEYWORDS,
@@ -730,8 +755,6 @@ const DATABASE_SQL_KEYWORDS: Partial<Record<DatabaseType, string[]>> = {
   doris: ["COMMENT", "MATERIALIZED", "MATERIALIZED VIEW", "DISTRIBUTED BY HASH", "DUPLICATE KEY", "AGGREGATE KEY", "UNIQUE KEY", "PRIMARY KEY", "PROPERTIES", "PARTITION BY", "BUCKETS", "LATERAL VIEW", "EXPLODE", "ARRAY", "MAP", "STRUCT", "BITMAP", "HLL"],
   starrocks: ["COMMENT", "MATERIALIZED", "MATERIALIZED VIEW", "DISTRIBUTED BY HASH", "DUPLICATE KEY", "PROPERTIES", "PARTITION BY", "BUCKETS", "LATERAL VIEW"],
   dameng: ["COMMENT"],
-  kingbase: ["COMMENT"],
-  vastbase: ["COMMENT"],
   spark: ["COMMENT"],
   iotdb: ["COMMENT"],
 };
@@ -878,6 +901,16 @@ const DATA_TYPE_KEYWORDS = new Set([
   "TEXT",
   "TIME",
   "TIMESTAMP",
+  "TIMESTAMPTZ",
+  "TIMETZ",
+  "INTERVAL",
+  "INT2",
+  "INT4",
+  "INT8",
+  "FLOAT4",
+  "FLOAT8",
+  "VARBIT",
+  "DOUBLE PRECISION",
   "TINYINT",
   "UNIQUEIDENTIFIER",
   "VARBINARY",
@@ -1855,7 +1888,7 @@ class SqlCompletionProvider {
     if (!context.dataTypeContext) {
       this.items.push(...customSnippetItems);
     }
-    this.items.push(...buildSqlServerLocalVariableItems(context));
+    this.items.push(...buildLocalVariableItems(context));
     if (!pendingJoinKeyword && !context.exclusiveTableSuggestions && !context.exclusiveColumnSuggestions && !context.exclusiveRoutineSuggestions) {
       if (!preferReferencedColumns && !context.dataTypeContext) {
         this.items.push(...buildSnippetItems(context.prefix, snippets.filter(shouldFormatBuiltinSnippet), this.input.keywordCase, this.databaseType));
@@ -2354,7 +2387,7 @@ function getSqlLexicalContext(sql: string, cursor: number, options: SqlSemanticB
       inBacktick = true;
     } else if (ch === "[") {
       inBracket = true;
-    } else if (ch === "$") {
+    } else if (ch === "$" && options.databaseType !== "mysql" && options.dialect !== "mysql") {
       const marker = matchDollarQuoteTag(sql, index);
       if (marker) {
         dollarTag = marker;
@@ -2835,7 +2868,8 @@ export function getSqlCompletionContext(sql: string, cursor: number, options: Sq
   const statementKind = detectStatementKind(beforeCursor || fullStatement);
   const selectListWildcardAfterCursor = isStandaloneSelectWildcard(rawStatement, cursor - statementSpan.start, selectListColumnContext, statementKind, resolveSqlDialectId(options));
   const preferredValueKeywords = sqlServerDatepartCompletionValues(beforeCursor, options.databaseType);
-  const localVariables = prefix.startsWith("@") ? collectSqlServerLocalVariables(sql, cursor, options) : undefined;
+  const mysqlVariablesAllowed = (options.databaseType === "mysql" || (!options.databaseType && options.dialect === "mysql")) && !prefix.startsWith("@") && !qualifier && !dataTypeContext && !afterTableTrigger && !insertInfo && !inCallRoutineContext;
+  const localVariables = prefix.startsWith("@") ? collectSqlServerLocalVariables(sql, cursor, options) : mysqlVariablesAllowed ? collectMysqlRoutineVariables(sql, cursor) : undefined;
   const preferredKeywords = qualifier ? [] : preferredKeywordsForCompletion(beforeCursor, beforeToken, selectListColumnContext, exclusiveTableSuggestions, updateInfo, deleteInfo, options.databaseType);
   const contextKind = detectCompletionContextKind({
     qualifier,
@@ -5142,11 +5176,12 @@ function buildPreferredKeywordItems(prefix: string, keywords: string[], keywordC
     }));
 }
 
-function buildSqlServerLocalVariableItems(context: SqlCompletionContext): SqlCompletionItem[] {
+function buildLocalVariableItems(context: SqlCompletionContext): SqlCompletionItem[] {
   return (context.localVariables ?? [])
     .filter((variable) => matchesPrefix(variable, context.prefix))
     .map((variable) => ({
       label: variable,
+      apply: variable.startsWith("@") ? variable : quoteCompletionApplyIdentifier(variable, "mysql"),
       type: "variable" as const,
       detail: "local variable",
       boost: computeBoost(variable, context.prefix) + 4_000,
@@ -6207,32 +6242,65 @@ export function buildSnippetItemsForTest(prefix: string, snippets: SqlSnippet[],
   return buildSnippetItems(prefix, snippets, keywordCase, databaseType);
 }
 
+// Snippet names and triggers may contain spaces ("S item"), but a completion
+// prefix (the word being typed) never can, and CodeMirror's matcher scores the
+// whole option label — an interior space dumps the snippet into its heavily
+// penalized gap tiers, or drops it entirely for single-letter queries that do
+// not start the label. Match the whitespace-free spelling of the trigger and
+// label ("S item" ↔ "sitem") as well, and expose it as filterText so the
+// CodeMirror-facing label starts with a word the user can actually type.
+function snippetCompactText(value: string): string {
+  return value.replace(/\s+/g, "");
+}
+
+function snippetCompactVariants(value: string): string[] {
+  const compact = snippetCompactText(value);
+  // Empty compact text (whitespace-only trigger from an imported pack) keeps
+  // the original surface only.
+  return compact !== value && compact.length > 0 ? [value, compact] : [value];
+}
+
 function buildSnippetItems(prefix: string, snippets: SqlSnippet[], keywordCase?: SqlKeywordCase, databaseType?: DatabaseType): SqlCompletionItem[] {
   if (!prefix) return [];
   return snippets
     .filter((snippet) => {
       if (snippet.enabled === false) return false;
-      const matchesSnippetPrefix = matchesPrefix(snippet.prefix, prefix);
-      const matchesSnippetLabel = prefix.length > snippet.prefix.length && matchesPrefix(snippet.label, prefix);
-      return matchesSnippetPrefix || matchesSnippetLabel;
+      const prefixVariants = snippetCompactVariants(snippet.prefix);
+      const labelVariants = snippetCompactVariants(snippet.label);
+      // Label matching stays gated on the query outgrowing the trigger so short
+      // triggers keep owning their prefix; the compact spellings join the same
+      // gates as their originals.
+      const labelGate = prefix.length > Math.max(...prefixVariants.map((variant) => variant.length));
+      return prefixVariants.some((variant) => matchesPrefix(variant, prefix)) || (labelGate && labelVariants.some((variant) => matchesPrefix(variant, prefix)));
     })
     .map((snippet) => {
-      const boostByPrefix = computeBoost(snippet.prefix, prefix);
-      const boostByLabel = computeBoost(snippet.label, prefix);
-      const matchesByPrefix = matchesPrefix(snippet.prefix, prefix);
-      const isExactCustomTrigger = !shouldFormatBuiltinSnippet(snippet) && snippet.prefix.toLowerCase() === prefix.toLowerCase();
-      // When the user types past the snippet prefix (e.g. "sele" vs prefix "sel"),
-      // they are likely typing the actual keyword — reduce the base boost so
-      // the real keyword can rank higher.
-      const baseBoost = matchesByPrefix ? 4000 : 0;
+      const prefixVariants = snippetCompactVariants(snippet.prefix);
+      const labelVariants = snippetCompactVariants(snippet.label);
+      const boostByPrefix = Math.max(...prefixVariants.map((variant) => computeBoost(variant, prefix)));
+      const boostByLabel = Math.max(...labelVariants.map((variant) => computeBoost(variant, prefix)));
+      const matchesByPrefix = prefixVariants.some((variant) => matchesPrefix(variant, prefix));
+      const isExactCustomTrigger = !shouldFormatBuiltinSnippet(snippet) && prefixVariants.some((variant) => variant.toLowerCase() === prefix.toLowerCase());
+      // Snippets sit below identifiers, not between them: tables and columns
+      // carry +1000/+2000 relevance boosts on top of their match score, so a
+      // partial snippet prefix must not outrank the table or column the user is
+      // typing (frequent accidental snippet inserts). 400 keeps snippets above
+      // plain keywords while an equal-quality table/column match wins; typing
+      // past the snippet prefix ("sele" vs "sel") still drops the boost to 0,
+      // and an exact custom trigger keeps its dedicated large bonus below.
+      const baseBoost = matchesByPrefix ? 400 : 0;
       // Placeholder replacement runs on the original (UPPER-case) body first,
       // then keyword casing is applied to both variants uniformly.
       const resolvedBody = resolveSqlSnippetBodyForDatabase(snippet, databaseType);
       const body = applyBuiltinSnippetKeywordCase(snippet, resolvedBody, keywordCase);
       const apply = finalizeSnippetCursor(applyBuiltinSnippetKeywordCase(snippet, applyBuiltinSnippetPlaceholders(snippet, resolvedBody), keywordCase));
+      const compactPrefix = snippetCompactText(snippet.prefix);
+      // filterText stays the trigger surface: the compact form when the trigger
+      // itself carries spaces (a completion prefix never can), otherwise the
+      // trigger as-is so exact-trigger and collision handling stay untouched.
+      const filterText = compactPrefix.length > 0 && compactPrefix !== snippet.prefix ? compactPrefix : snippet.prefix;
       return {
         label: snippet.label,
-        filterText: snippet.prefix,
+        filterText,
         type: "snippet" as const,
         detail: body,
         apply,

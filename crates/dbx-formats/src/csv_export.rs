@@ -10,6 +10,11 @@ pub enum CsvQuoteMode {
     All,
     Necessary,
     Never,
+    /// 类型感知引号（mod 42）：字符串值一律加引号，数值/布尔裸写。
+    /// 到达 [`push_csv_field_with_format`] 的都是文本（表头、字符串单元格、
+    /// JSON 化的对象/数组），与 [`CsvQuoteMode::All`] 同路径；数值/布尔在
+    /// [`push_csv_value_formatted`] 的类型分发里根本不会走到这里。
+    Strings,
 }
 
 /// CSV 里 NULL 的默认字面量（`\N`，MySQL `SELECT ... INTO OUTFILE` 惯例）。
@@ -134,17 +139,16 @@ fn at_sign_begins_excel_formula(rest: &str) -> bool {
 fn is_excel_exact_decimal_literal(value: &str) -> bool {
     let bytes = value.as_bytes();
     let digits = if matches!(bytes.first(), Some(b'+') | Some(b'-')) { &bytes[1..] } else { bytes };
-    match digits.iter().position(|&byte| byte == b'.') {
-        Some(dot) => is_exact_digit_run(&digits[..dot]) && is_exact_digit_run(&digits[dot + 1..]),
-        None => is_exact_digit_run(digits),
-    }
-}
-
-/// 整段是否为非空纯 ASCII 数字，且有效数字（去前导零）不超过 Excel 精度上限。
-fn is_exact_digit_run(bytes: &[u8]) -> bool {
-    !bytes.is_empty()
-        && bytes.iter().all(u8::is_ascii_digit)
-        && bytes.iter().skip_while(|&&byte| byte == b'0').count() <= EXCEL_SIGNIFICANT_DIGIT_LIMIT
+    let valid_digits = |part: &[u8]| !part.is_empty() && part.iter().all(u8::is_ascii_digit);
+    let valid = match digits.iter().position(|&byte| byte == b'.') {
+        Some(dot) => valid_digits(&digits[..dot]) && valid_digits(&digits[dot + 1..]),
+        None => valid_digits(digits),
+    };
+    // Count the whole decimal together: fractional zeros are significant once
+    // the first nonzero digit has appeared in either part.
+    valid
+        && digits.iter().filter(|&&byte| byte != b'.').skip_while(|&&byte| byte == b'0').count()
+            <= EXCEL_SIGNIFICANT_DIGIT_LIMIT
 }
 
 /// 在单元格值开头写入公式中和前缀，每单元格调用一次：
@@ -209,7 +213,9 @@ pub fn push_csv_field(out: &mut String, value: &str, quote_mode: CsvQuoteMode) {
 pub fn push_csv_field_with_format(out: &mut String, value: &str, format: &CsvTextFormat) {
     match format.quote_mode {
         // 守卫前缀写在引号内：`"'-total"` 是合法的带引号字段，`'"-total"'` 不是
-        CsvQuoteMode::All => {
+        // Strings（mod 42）与 All 同路径：进入这里的值都是文本，一律加引号；
+        // 数值/布尔裸写的分流在 push_csv_value_formatted 的类型分发里。
+        CsvQuoteMode::All | CsvQuoteMode::Strings => {
             out.push(format.quote_char);
             push_formula_guard(out, value);
             push_csv_escaped_content(out, value, format.quote_char);
@@ -665,6 +671,31 @@ mod tests {
     }
 
     #[test]
+    fn strings_quote_mode_quotes_text_values_headers_and_json_but_not_numbers_or_booleans() {
+        // mod 42：类型感知引号——字符串/表头/JSON 化对象加引号，数值/布尔裸写，
+        // NULL 字面量保持 necessary 的裸写语义（`\N` 带引号后回读端不再识别）。
+        let out = format_csv_with_options(
+            &["id".to_string(), "note".to_string(), "flag".to_string()],
+            &[
+                vec![json!(1), json!("0123"), json!(true)],
+                vec![json!(2.5), json!("say \"hi\""), json!(false)],
+                vec![json!(3), serde_json::Value::Null, json!("[1, 2]")],
+            ],
+            CsvQuoteMode::Strings,
+            Some(DEFAULT_CSV_NULL_LITERAL),
+        );
+        assert_eq!(
+            out,
+            concat!(
+                "\"id\",\"note\",\"flag\"\n",
+                "1,\"0123\",true\n",
+                "2.5,\"say \"\"hi\"\"\",false\n",
+                "3,\\N,\"[1, 2]\""
+            )
+        );
+    }
+
+    #[test]
     fn semicolon_delimiter_separates_and_quotes_only_delimiter_occurrences() {
         let out = super::format_csv_with_format(
             &["id".to_string(), "comma".to_string(), "semi".to_string()],
@@ -1053,6 +1084,26 @@ mod tests {
                 "\"'-cmd\""
             )
         );
+    }
+
+    #[test]
+    fn negative_decimal_precision_counts_digits_across_the_decimal_point() {
+        for (value, guarded) in [
+            ("-123456789012345.6", true),
+            ("-12345678.12345678", true),
+            ("-12345678.01234567", true),
+            ("-12345678.1234567", false),
+            ("-00012345678.1234567", false),
+            ("-0.000000000000000123456789012345", false),
+            ("-0.0000000000000001234567890123456", true),
+            ("-0.00000000000000000000", false),
+        ] {
+            let expected = format!("{}{value}", if guarded { "'" } else { "" });
+            let rows = [vec![json!(value)]];
+            assert_eq!(format_csv(&["v".to_string()], &rows), format!("\"v\"\n\"{expected}\""), "CSV: {value}");
+            assert_eq!(format_tsv(&["v".to_string()], &rows), format!("v\n{expected}"), "TSV: {value}");
+            assert_eq!(super::strip_formula_guard(&expected), value);
+        }
     }
 
     #[test]

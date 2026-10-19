@@ -82,6 +82,7 @@ const { t } = useI18n();
 
 let shouldFocusAdjacentOnClose = false;
 let tabDirection: 1 | -1 = 1;
+let focusRestoreElement: HTMLElement | null = null;
 
 function getTriggerElement(): HTMLElement | undefined {
   const target = triggerButton.value;
@@ -200,11 +201,19 @@ watch(open, async (value) => {
     searchText.value = "";
     highlightIndex.value = -1;
     activeHelpOption.value = undefined;
+    const restoreTarget = focusRestoreElement;
+    focusRestoreElement = null;
     if (shouldFocusAdjacentOnClose) {
       const dir = tabDirection;
       shouldFocusAdjacentOnClose = false;
       await nextTick();
       focusAdjacentElement(dir);
+    } else if (restoreTarget) {
+      // Reka's modal popover refocuses the trigger synchronously on close, so
+      // the restore must land on the next tick to win for shortcut-opened
+      // dropdowns.
+      await nextTick();
+      if (restoreTarget.isConnected) restoreTarget.focus();
     }
     return;
   }
@@ -304,16 +313,6 @@ function optionCount() {
   return filteredOptions.value.length + (canSelectCustom.value ? 1 : 0);
 }
 
-// Opens the dropdown from outside (e.g. the focusDatabaseSelect shortcut);
-// the open watcher focuses the search input and highlights the selection.
-function openDropdown(): boolean {
-  if (props.disabled) return false;
-  open.value = true;
-  return true;
-}
-
-defineExpose({ openDropdown });
-
 function handleKeydown(event: KeyboardEvent) {
   if (event.isComposing || event.key === "Process" || event.keyCode === 229) return;
   if (event.key === "ArrowDown") {
@@ -353,6 +352,18 @@ function handleKeydown(event: KeyboardEvent) {
     open.value = false;
   }
 }
+
+// Opens the dropdown from outside (toolbar picker shortcuts, and the F3
+// focusDatabaseSelect shortcut); the open watcher focuses the search input
+// and highlights the selection.
+defineExpose({
+  openDropdown: () => {
+    if (props.disabled) return false;
+    focusRestoreElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    open.value = true;
+    return true;
+  },
+});
 </script>
 
 <template>

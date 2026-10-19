@@ -6,6 +6,7 @@ import { isNoSnapshotErrorResult, isQueryExecutionErrorResult } from "@/lib/quer
 import { buildTableSelectSql, requiresEagerTableMetadataForDataOpen } from "@/lib/table/tableSelectSql";
 import { resolveTableDefaultSort, applyTableDefaultSortResult } from "@/lib/table/tableDefaultSort";
 import { tableDataLargeValuePreviewOptions } from "@/lib/dataGrid/dataGridLargeValues";
+import { foreignKeyDrillTableTargetFromTab, pushForeignKeyDrillBack } from "@/lib/dataGrid/foreignKeyDrillBack";
 import { editableRowIdentifierColumns, physicalTablePrimaryKeys, shouldIncludeSyntheticRowId } from "@/lib/table/tableEditing";
 import { tableOpenPageLimit } from "@/lib/table/tableOpenPageLimit";
 import { uuid } from "@/lib/common/utils";
@@ -62,7 +63,7 @@ function openMongoCollectionTarget(target: NavigationTarget, reuseMode: DataTabR
   return tabId;
 }
 
-async function openTableTarget(target: NavigationTarget, options: NavigationOpenOptions & { tableInfoTab?: TableInfoTab; reuseTabId?: string } = {}) {
+async function openTableTarget(target: NavigationTarget, options: NavigationOpenOptions & { tableInfoTab?: TableInfoTab; reuseTabId?: string; drillBack?: boolean } = {}) {
   const connectionStore = useConnectionStore();
   const queryStore = useQueryStore();
   const settingsStore = useSettingsStore();
@@ -91,6 +92,19 @@ async function openTableTarget(target: NavigationTarget, options: NavigationOpen
   // 状态由 canReuseActiveDataTab 拒绝，回退到原新建 tab 流程）
   const reuseTab = options.reuseTabId ? queryStore.tabs.find((tab) => tab.id === options.reuseTabId) : undefined;
   const canReuse = !!reuseTab && canReuseActiveDataTab(reuseTab, { connectionId: target.connectionId, database: target.database, schema: tableSchema, catalog: target.catalog, tableName: target.tableName });
+  // mod 43：外键跳转记录返回点——仅在真正复用当前 tab 时（回退新建 tab 的
+  // 场景旧内容仍在原 tab，返回交给全局 Alt+← 标签历史）；必须在下方改写
+  // tab 目标之前捕获跳转前状态（含用户过滤条件）
+  if (options.drillBack && canReuse && reuseTab) {
+    const restoreTarget = foreignKeyDrillTableTargetFromTab(reuseTab);
+    if (restoreTarget) {
+      pushForeignKeyDrillBack(reuseTab.id, {
+        restore: { kind: "tableTarget", target: restoreTarget },
+        arrivedAt: { connectionId: target.connectionId, database: target.database, catalog: target.catalog, schema: tableSchema, tableName: target.tableName },
+        label: reuseTab.tableMeta?.tableName ?? reuseTab.title,
+      });
+    }
+  }
   const tabId = canReuse ? reuseTab!.id : queryStore.createTab(target.connectionId, target.database, tabTitle, "data", tableSchema, undefined, undefined, { forceNew: true });
   const targetTab = queryStore.tabs.find((tab) => tab.id === tabId);
   if (targetTab) {
@@ -438,11 +452,14 @@ export function useNavigationTargets(dialogs: { showFieldLineageDialog: { value:
    * SQL 重新标记 tableMeta，跳转结果自身可继续跳转/编辑。调用形态对齐
    * onReloadData 的 query 分支（useDataGridActions.ts）。
    */
-  async function executeTableTargetInQueryTab(target: NavigationTarget, options: { tabId: string }) {
+  async function executeTableTargetInQueryTab(target: NavigationTarget, options: { tabId: string; drillBack?: boolean }) {
     const findTab = () => queryStore.tabs.find((item) => item.id === options.tabId);
     const tab = findTab();
     if (!tab || tab.mode !== "query") return;
     connectionStore.activeConnectionId = target.connectionId;
+    // mod 43：跳转改写结果面板前捕获当前显示结果的 SQL——作废/取消在途
+    // 执行可能让新结果落地，必须先取
+    const previousDisplayedSql = options.drillBack ? (tab.resultBaseSql ?? tab.lastExecutedSql ?? tab.sql) : undefined;
     if (tab.isExecuting && tab.executionId) {
       await queryStore.cancelTabExecution(tab.id);
       const afterCancel = findTab();
@@ -507,15 +524,53 @@ export function useNavigationTargets(dialogs: { showFieldLineageDialog: { value:
         limit: pageLimit,
       });
       if (!navigationAlive()) return;
-      const multiResult = (findTab()?.results?.length ?? 0) > 1;
-      await queryStore.executeTabSql(options.tabId, sql, {
-        resultBaseSql: sql,
-        resultSortedSql: undefined,
-        preserveResultDuringExecution: true,
-        ...(multiResult ? { replaceActiveResultInGroup: true, preserveActiveResultIndex: true } : {}),
-      });
+      // mod 43：记录返回点——重跑 previousDisplayedSql 即回到跳转前结果
+      if (options.drillBack && previousDisplayedSql) {
+        pushForeignKeyDrillBack(options.tabId, { restore: { kind: "queryResult", sql: previousDisplayedSql }, arrivedSql: sql, label: target.tableName });
+      }
+      await runResultsExecutionInQueryTab(options.tabId, sql);
     } catch (e: any) {
       if (navigationAlive()) queryStore.setErrorResult(options.tabId, e);
+    }
+  }
+
+  /** 结果面板执行的公共尾巴：以 sql 为新 resultBaseSql 重跑（multi-result 组内替换，保持当前活动结果位） */
+  async function runResultsExecutionInQueryTab(tabId: string, sql: string) {
+    const multiResult = (queryStore.tabs.find((item) => item.id === tabId)?.results?.length ?? 0) > 1;
+    await queryStore.executeTabSql(tabId, sql, {
+      resultBaseSql: sql,
+      resultSortedSql: undefined,
+      preserveResultDuringExecution: true,
+      ...(multiResult ? { replaceActiveResultInGroup: true, preserveActiveResultIndex: true } : {}),
+    });
+  }
+
+  /**
+   * mod 43：外键跳转返回（query tab）——在结果面板内重跑跳转前的 SQL，
+   * 编辑器 SQL 依旧不动；作废/取消在途执行等语义与 executeTableTargetInQueryTab 一致。
+   */
+  async function executeSqlInQueryTabResults(tabId: string, sql: string) {
+    const findTab = () => queryStore.tabs.find((item) => item.id === tabId);
+    let tab = findTab();
+    if (!tab || tab.mode !== "query") return;
+    connectionStore.activeConnectionId = tab.connectionId;
+    if (tab.isExecuting && tab.executionId) {
+      await queryStore.cancelTabExecution(tabId);
+      tab = findTab();
+      if (!tab || tab.mode !== "query") return;
+    }
+    const preparationId = uuid();
+    queryStore.setExecutingWithId(tabId, preparationId);
+    const navigationAlive = () => {
+      const current = findTab();
+      return !!current && current.mode === "query" && current.executionId === preparationId && !current.isCancelling;
+    };
+    try {
+      await connectionStore.ensureConnected(tab.connectionId);
+      if (!navigationAlive()) return;
+      await runResultsExecutionInQueryTab(tabId, sql);
+    } catch (e: any) {
+      if (navigationAlive()) queryStore.setErrorResult(tabId, e);
     }
   }
 
@@ -605,5 +660,5 @@ export function useNavigationTargets(dialogs: { showFieldLineageDialog: { value:
     }
   }
 
-  return { openLineageTarget, openDatabaseSearchTarget, openDiagramTarget, openObjectBrowserTableTarget, onStructureEditorSaved, openTableTarget, executeTableTargetInQueryTab };
+  return { openLineageTarget, openDatabaseSearchTarget, openDiagramTarget, openObjectBrowserTableTarget, onStructureEditorSaved, openTableTarget, executeTableTargetInQueryTab, executeSqlInQueryTabResults };
 }

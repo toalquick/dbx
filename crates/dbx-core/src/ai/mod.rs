@@ -1,4 +1,5 @@
 pub use dbx_ai_provider::ai::*;
+pub use dbx_ai_provider::copilot_auth;
 
 pub mod agent_explain;
 pub mod agent_kv;

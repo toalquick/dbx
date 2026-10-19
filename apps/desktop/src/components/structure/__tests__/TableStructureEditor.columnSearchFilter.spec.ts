@@ -241,6 +241,9 @@ vi.mock("@/stores/connectionStore", () => ({
   useConnectionStore: () => ({
     ensureConnected: mocks.ensureConnected,
     getConfig: (connectionId: string) => (connectionId === mocks.connection.id ? mocks.connection : undefined),
+    // 上游为 oracle 约束/索引编辑新增的连接世代守卫：watch 在 setup 立即求值。
+    connectionStateRevision: () => 0,
+    isCurrentConnectionStateRevision: () => true,
   }),
 }));
 vi.mock("@/stores/productionSafetyStore", () => ({ useProductionSafetyStore: () => ({ requestConfirmation: vi.fn() }) }));

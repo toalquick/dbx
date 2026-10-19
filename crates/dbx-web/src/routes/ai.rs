@@ -87,6 +87,19 @@ pub struct AiCancelStreamRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CopilotDevicePollRequest {
+    pub device_code: String,
+    pub interval_secs: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CopilotCurrentUserRequest {
+    pub access_token: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AiAgentStreamRequest {
     pub session_id: String,
     pub request: AiCompletionRequest,
@@ -341,6 +354,31 @@ pub async fn ai_resolve_model_effort(
 
 pub async fn ai_cancel_stream(Json(body): Json<AiCancelStreamRequest>) -> Result<Json<bool>, AppError> {
     let result = dbx_core::ai::cancel_stream(&body.session_id).await;
+    Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// GitHub Copilot device-flow sign-in
+// ---------------------------------------------------------------------------
+
+pub async fn copilot_device_start() -> Result<Json<dbx_core::ai::copilot_auth::CopilotDeviceAuthorization>, AppError> {
+    let result = dbx_core::ai::copilot_auth::copilot_device_start().await.map_err(AppError::from)?;
+    Ok(Json(result))
+}
+
+pub async fn copilot_device_poll(
+    Json(body): Json<CopilotDevicePollRequest>,
+) -> Result<Json<dbx_core::ai::copilot_auth::CopilotDevicePoll>, AppError> {
+    let result = dbx_core::ai::copilot_auth::copilot_device_poll(&body.device_code, body.interval_secs)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(result))
+}
+
+pub async fn copilot_current_user(
+    Json(body): Json<CopilotCurrentUserRequest>,
+) -> Result<Json<dbx_core::ai::copilot_auth::CopilotUser>, AppError> {
+    let result = dbx_core::ai::copilot_auth::copilot_current_user(&body.access_token).await.map_err(AppError::from)?;
     Ok(Json(result))
 }
 
@@ -607,6 +645,7 @@ mod tests {
             pi_agent_cli_env: Default::default(),
             opencode_cli_path: None,
             opencode_cli_env: Default::default(),
+            opencode_cli_version: None,
             cursor_cli_path: None,
             cursor_cli_env: Default::default(),
             grok_cli_path: None,
@@ -716,6 +755,7 @@ mod tests {
             pi_agent_cli_env: Default::default(),
             opencode_cli_path: None,
             opencode_cli_env: Default::default(),
+            opencode_cli_version: None,
             cursor_cli_path: None,
             cursor_cli_env: Default::default(),
             grok_cli_path: None,

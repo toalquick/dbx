@@ -1,6 +1,6 @@
 use super::{
-    value_text, write_bytes, DataGridDsvOptions, DataGridExtractError, DataGridExtractErrorCode, DataGridQuotePolicy,
-    ExtractContext,
+    strings_policy_string_like, value_text, write_bytes, DataGridDsvOptions, DataGridExtractError,
+    DataGridExtractErrorCode, DataGridQuotePolicy, ExtractContext,
 };
 use std::borrow::Cow;
 use std::io::Write;
@@ -10,10 +10,12 @@ const MAX_NULL_TEXT_CHARACTERS: usize = 64;
 
 /// A single DSV data cell. NULL is carried as structured state (not pre-flattened
 /// into the `null_text` string) so the sentinel can be encoded distinctly from a
-/// string value that happens to equal it.
+/// string value that happens to equal it. `string_like` remembers whether the
+/// value came from a JSON string / object / array (as opposed to a number or
+/// boolean) — the Strings quote policy (mod 42) quotes only those.
 enum DsvCell<'a> {
     Null,
-    Text(Cow<'a, str>),
+    Text(Cow<'a, str>, bool),
 }
 
 pub(super) fn write_dsv(
@@ -40,12 +42,12 @@ pub(super) fn write_dsv(
         }
         write_dsv_data_row(
             output,
-            context.selected_source_indexes.iter().map(|source_index| {
+            context.selected_columns.iter().zip(context.selected_source_indexes.iter()).map(|(column, source_index)| {
                 let value = &row[*source_index];
                 if value.is_null() {
                     DsvCell::Null
                 } else {
-                    DsvCell::Text(value_text(value))
+                    DsvCell::Text(value_text(value), strings_policy_string_like(value, column.data_type.as_deref()))
                 }
             }),
             options,
@@ -151,6 +153,8 @@ fn write_dsv_field(
 ) -> Result<(), DataGridExtractError> {
     let should_quote = match options.quote_policy {
         DataGridQuotePolicy::Always => true,
+        // 表头是文本：Strings 模式与导出侧一致，表头也加引号（mod 42）。
+        DataGridQuotePolicy::Strings => true,
         DataGridQuotePolicy::Never => false,
         DataGridQuotePolicy::Minimal => dsv_needs_quote(value, options, quote_char_triggers_quoting),
     };
@@ -173,9 +177,16 @@ fn write_dsv_data_field(
 ) -> Result<(), DataGridExtractError> {
     match cell {
         DsvCell::Null => write_bytes(output, options.null_text.as_bytes()),
-        DsvCell::Text(value) => {
+        DsvCell::Text(value, string_like) => {
             let should_quote = match options.quote_policy {
                 DataGridQuotePolicy::Always => true,
+                // 类型感知引号（mod 42）：字符串/JSON 文本加引号，数值/布尔裸写；
+                // 结构性风险（含分隔符/换行）与 NULL 哨兵冲突仍然强制加引号。
+                DataGridQuotePolicy::Strings => {
+                    *string_like
+                        || dsv_needs_quote(value, options, quote_char_triggers_quoting)
+                        || value.as_ref() == options.null_text.as_str()
+                }
                 DataGridQuotePolicy::Never => false,
                 DataGridQuotePolicy::Minimal => {
                     dsv_needs_quote(value, options, quote_char_triggers_quoting)
@@ -193,17 +204,29 @@ fn write_dsv_data_field(
 pub(super) fn write_one_row(context: &ExtractContext<'_>, output: &mut dyn Write) -> Result<(), DataGridExtractError> {
     let options = DataGridDsvOptions { column_separator: ",".to_string(), ..context.request.options.dsv.clone() };
     validate_dsv_options(&options, false)?;
+    // selected_columns 与 selected_source_indexes 一一对应（build_context 同序构建）；
+    // 数值列的 string_like 判定依赖列类型，见 strings_policy_string_like。
+    let cells = context
+        .selected_columns
+        .iter()
+        .zip(context.selected_source_indexes.iter())
+        .map(|(column, source_index)| (column.data_type.as_deref(), *source_index))
+        .collect::<Vec<_>>();
     let values = context
         .request
         .rows
         .iter()
-        .flat_map(|row| context.selected_source_indexes.iter().map(move |source_index| &row[*source_index]));
+        .flat_map(|row| cells.iter().map(move |(data_type, source_index)| (&row[*source_index], *data_type)));
     let mut first = true;
-    for value in values {
+    for (value, data_type) in values {
         if !first {
             write_bytes(output, options.column_separator.as_bytes())?;
         }
-        let cell = if value.is_null() { DsvCell::Null } else { DsvCell::Text(value_text(value)) };
+        let cell = if value.is_null() {
+            DsvCell::Null
+        } else {
+            DsvCell::Text(value_text(value), strings_policy_string_like(value, data_type))
+        };
         // A one-row extraction is an RFC4180 CSV record, so embedded quotes must
         // be escaped.
         write_dsv_data_field(output, &cell, &options, true)?;

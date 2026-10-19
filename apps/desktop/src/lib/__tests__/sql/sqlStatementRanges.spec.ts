@@ -909,6 +909,28 @@ END;`;
     }
   });
 
+  it("keeps DECODE consecutive CASE expressions inside Oracle-family procedures", () => {
+    // Punctuation between `end` and the next `case` must not look like PL/SQL `END CASE`.
+    const procedure = `CREATE OR REPLACE PROCEDURE dm.sp_demo IS
+BEGIN
+  INSERT INTO t(c)
+  SELECT decode(
+    company_no,
+    'A', (case when x = 1 then 'one' else 'other' end),
+    'B', (case when y = 2 then 'two' else 'other' end)
+  ) as business_type_name
+  FROM src;
+  COMMIT;
+EXCEPTION
+  WHEN OTHERS THEN
+    NULL;
+END sp_demo;`;
+
+    for (const database of ["oracle", "oceanbase-oracle"] as const) {
+      expect(rangeSqlTexts(splitSqlStatementRanges(procedure, database))).toEqual([procedure]);
+    }
+  });
+
   it("keeps SAP HANA DO blocks together", () => {
     const ranges = splitSqlStatementRanges(sapHanaDoBlockFixture, "saphana");
 
@@ -935,8 +957,84 @@ SELECT 2 FROM DUMMY;`;
     expect(rangeSqlTexts(splitSqlStatementRanges(sql, "saphana"))).toEqual([sql.slice(0, sql.indexOf("\nSELECT 2")), "SELECT 2 FROM DUMMY"]);
   });
 
+  it("keeps nested CASE expressions in a SAP HANA procedure GROUP BY together", () => {
+    const sql = `ALTER PROCEDURE PUBLIC.P
+LANGUAGE SQLSCRIPT
+SQL SECURITY INVOKER
+AS
+BEGIN
+  T = SELECT 1 FROM DUMMY
+  GROUP BY
+    CASE WHEN KHLX='老客' THEN CASE WHEN SCYEAR='0000' THEN NULL ELSE SCYEAR END ELSE LEFT(CASE WHEN SCDAT_OLD='00000000' THEN NULL ELSE SCDAT_OLD END,4) END,
+    CASE WHEN KHLX='老客' THEN CASE WHEN SCDAT='00000000' THEN NULL ELSE SCDAT END ELSE (CASE WHEN SCDAT_OLD='00000000' THEN NULL ELSE SCDAT_OLD END)END;
+END;
+SELECT 2 FROM DUMMY;`;
+
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "saphana"))).toEqual([sql.slice(0, sql.indexOf("\nSELECT 2")), "SELECT 2 FROM DUMMY"]);
+  });
+
+  it.each(["DO BEGIN T = SELECT CASE WHEN 1 = 1 THEN 1 ELSE 0 END FROM DUMMY; END;", "do begin t = select 1 from dummy; end;"])("keeps single-line SAP HANA blocks together: %s", (sql) => {
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "saphana"))).toEqual([sql]);
+  });
+
   it("still splits SAP HANA ALTER PROCEDURE metadata commands", () => {
     expect(rangeSqlTexts(splitSqlStatementRanges("ALTER PROCEDURE PUBLIC.P RECOMPILE; SELECT 1 FROM DUMMY;", "saphana"))).toEqual(["ALTER PROCEDURE PUBLIC.P RECOMPILE", "SELECT 1 FROM DUMMY"]);
+  });
+
+  it("keeps Firebird CREATE OR ALTER TRIGGER blocks together (#12407)", () => {
+    const trigger = `CREATE OR ALTER TRIGGER "WL_FYD_TP_AU" FOR "WL_FYD" ACTIVE
+AFTER UPDATE
+as
+begin
+  /* Trigger text */
+  IF ( COALESCE(NEW.QSTPS,0) <> COALESCE(OLD.QSTPS,0) ) THEN
+  BEGIN
+    UPDATE WL_FYD SET ZT='完成' WHERE ID= NEW.ID;
+  END
+end;`;
+    const sql = `${trigger}\nSELECT 2 FROM RDB$DATABASE;`;
+
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "firebird"))).toEqual([trigger, "SELECT 2 FROM RDB$DATABASE"]);
+  });
+
+  it("keeps Firebird procedure with local DECLARE statements together (#12407)", () => {
+    const procedure = `CREATE OR ALTER PROCEDURE SP_GET_USER (USER_ID INT)
+RETURNS (USERNAME VARCHAR(50), TOTAL_AMOUNT NUMERIC(18, 2))
+AS
+DECLARE VARIABLE V_TEMP NUMERIC(18, 2);
+DECLARE VARIABLE V_STATUS INT;
+BEGIN
+  SELECT FIRST 1 NAME FROM USERS WHERE ID = :USER_ID INTO :USERNAME;
+  V_TEMP = 100.50;
+  TOTAL_AMOUNT = :V_TEMP;
+  SUSPEND;
+END;`;
+    const sql = `${procedure}\nSELECT 1 FROM RDB$DATABASE;`;
+
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "firebird"))).toEqual([procedure, "SELECT 1 FROM RDB$DATABASE"]);
+  });
+
+  it("keeps Firebird EXECUTE BLOCK anonymous blocks together (#12407)", () => {
+    const block = `EXECUTE BLOCK
+RETURNS (OUT_ID INT)
+AS
+DECLARE VARIABLE I INT;
+BEGIN
+  I = 0;
+  WHILE (I < 10) DO
+  BEGIN
+    I = I + 1;
+  END
+  OUT_ID = I;
+  SUSPEND;
+END;`;
+    const sql = `${block}\nSELECT 1 FROM RDB$DATABASE;`;
+
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "firebird"))).toEqual([block, "SELECT 1 FROM RDB$DATABASE"]);
+  });
+
+  it("still splits Firebird ALTER TRIGGER metadata commands (#12407)", () => {
+    expect(rangeSqlTexts(splitSqlStatementRanges("ALTER TRIGGER TR_USERS INACTIVE; SELECT 1 FROM RDB$DATABASE;", "firebird"))).toEqual(["ALTER TRIGGER TR_USERS INACTIVE", "SELECT 1 FROM RDB$DATABASE"]);
   });
 });
 
@@ -1749,6 +1847,23 @@ SET t.no = s.no`;
 
     expect(range?.sql.trim()).toBe(sapHanaDoBlockFixture.slice(0, sapHanaDoBlockFixture.indexOf("\nSELECT 2")));
   });
+
+  it("returns the full Firebird trigger definition for cursors inside the body (#12407)", () => {
+    const trigger = `CREATE OR ALTER TRIGGER "WL_FYD_TP_AU" FOR "WL_FYD" ACTIVE
+AFTER UPDATE
+as
+begin
+  /* Trigger text */
+  IF ( COALESCE(NEW.QSTPS,0) <> COALESCE(OLD.QSTPS,0) ) THEN
+  BEGIN
+    UPDATE WL_FYD SET ZT='完成' WHERE ID= NEW.ID;
+  END
+end;`;
+    const sql = `${trigger}\nSELECT 2 FROM RDB$DATABASE;`;
+    const range = statementRangeAtCursor(sql, indexOf(sql, "UPDATE WL_FYD"), "firebird");
+
+    expect(range?.sql.trim()).toBe(trigger);
+  });
 });
 
 describe("executableStatementRanges", () => {
@@ -1859,6 +1974,37 @@ DISTRIBUTED BY HASH(product_id) BUCKETS 1`;
 
   it("does not split executable SAP HANA DO ranges at inner statements", () => {
     expect(rangeSqlTexts(executableStatementRanges(sapHanaDoBlockFixture, "saphana"))).toEqual([sapHanaDoBlockFixture.slice(0, sapHanaDoBlockFixture.indexOf("\nSELECT 2")), "SELECT 2 FROM DUMMY"]);
+  });
+
+  it("does not expose run targets for statements inside a Firebird trigger block (#12407)", () => {
+    const trigger = `CREATE OR ALTER TRIGGER "WL_FYD_TP_AU" FOR "WL_FYD" ACTIVE
+AFTER UPDATE
+as
+begin
+  /* Trigger text */
+  IF ( COALESCE(NEW.QSTPS,0) <> COALESCE(OLD.QSTPS,0) ) THEN
+  BEGIN
+    UPDATE WL_FYD SET ZT='完成' WHERE ID= NEW.ID;
+  END
+end;`;
+    const sql = `${trigger}\nSELECT 2 FROM RDB$DATABASE;`;
+
+    expect(rangeSqlTexts(executableStatementRanges(sql, "firebird"))).toEqual([trigger, "SELECT 2 FROM RDB$DATABASE"]);
+  });
+
+  it("keeps Firebird trigger without trailing semicolon as one executable range (#12407)", () => {
+    const trigger = `CREATE OR ALTER TRIGGER "WL_FYD_TP_AU" FOR "WL_FYD" ACTIVE
+AFTER UPDATE
+as
+begin
+  /* Trigger text */
+  IF ( COALESCE(NEW.QSTPS,0) <> COALESCE(OLD.QSTPS,0) ) THEN
+  BEGIN
+    UPDATE WL_FYD SET ZT='完成' WHERE ID= NEW.ID;
+  END
+end`;
+
+    expect(rangeSqlTexts(executableStatementRanges(trigger, "firebird"))).toEqual([trigger]);
   });
 
   it("returns executable SQL Server batches without GO delimiter lines", () => {

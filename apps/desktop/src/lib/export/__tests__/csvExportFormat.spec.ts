@@ -6,6 +6,7 @@ describe("csvQuoteMode", () => {
   it("normalizes the quote mode and accepts the never option", () => {
     expect(normalizeCsvQuoteMode("necessary")).toBe("necessary");
     expect(normalizeCsvQuoteMode("never")).toBe("never");
+    expect(normalizeCsvQuoteMode("strings")).toBe("strings");
     expect(normalizeCsvQuoteMode("all")).toBe("all");
     expect(normalizeCsvQuoteMode("bogus")).toBe("all");
     expect(normalizeCsvQuoteMode(undefined)).toBe("all");
@@ -69,5 +70,21 @@ describe("formatCsv", () => {
 
   it("never mode writes raw fields", () => {
     expect(formatCsv(columns, rows, { quoteMode: "never" })).toBe('id,note\n1,plain\n2,has "quotes", and commas');
+  });
+
+  it("strings mode quotes text values and headers but not numbers or booleans", () => {
+    expect(
+      formatCsv(
+        ["id", "note"],
+        [
+          [1, "0123"],
+          [true, 'say "hi"'],
+        ],
+        { quoteMode: "strings", includeHeader: false },
+      ),
+    ).toBe('1,"0123"\ntrue,"say ""hi"""');
+    expect(formatCsv(["id", "note"], [[2, "plain"]], { quoteMode: "strings" })).toBe('"id","note"\n2,"plain"');
+    // NULL 字面量保持裸写（necessary），回读端才能识别。
+    expect(formatCsv(["id", "note"], [[1, null]], { quoteMode: "strings", nullLiteral: "\\N" })).toBe('"id","note"\n1,\\N');
   });
 });

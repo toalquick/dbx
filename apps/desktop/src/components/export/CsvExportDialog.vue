@@ -88,6 +88,13 @@ function onOpenChange(value: boolean) {
           </span>
         </label>
         <label class="flex cursor-pointer items-start gap-3 rounded-md border p-3 transition-colors hover:bg-accent/50">
+          <input v-model="quoteMode" type="radio" value="strings" class="mt-0.5 h-4 w-4 shrink-0" data-csv-quote-mode="strings" />
+          <span class="min-w-0">
+            <span class="block text-sm font-medium">{{ t("grid.csvExportQuoteModeStrings") }}</span>
+            <span class="mt-1 block text-xs text-muted-foreground">{{ t("grid.csvExportQuoteModeStringsDescription") }}</span>
+          </span>
+        </label>
+        <label class="flex cursor-pointer items-start gap-3 rounded-md border p-3 transition-colors hover:bg-accent/50">
           <input v-model="quoteMode" type="radio" value="never" class="mt-0.5 h-4 w-4 shrink-0" data-csv-quote-mode="never" />
           <span class="min-w-0">
             <span class="block text-sm font-medium">{{ t("grid.csvExportQuoteModeNever") }}</span>

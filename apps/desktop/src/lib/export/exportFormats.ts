@@ -24,7 +24,20 @@ export function formatCsv(columns: string[], rows: ExportCellValue[][], options:
   // 整数列直接报错），ClickHouse 的 CSV 读取在引号内遇到 `\N` 会解析失败；只有裸 `\N` 是
   // 它们与 MySQL 共同识别的 NULL。字面量自身含分隔符/引号/换行时才加引号。
   const nullField = literal ? escapeCsvField(literal, "necessary", delimiter, quoteChar) : "";
-  const body = rows.map((row) => row.map((cell) => (cell === null ? nullField : escapeCsvField(String(cell), quoteMode, delimiter, quoteChar))).join(delimiter)).join("\n");
+  const body = rows
+    .map((row) =>
+      row
+        .map((cell) => {
+          if (cell === null) return nullField;
+          // strings（mod 42）按单元格原始类型分流：字符串加引号（escapeCsvField 把
+          // strings 当 all 处理），数值/布尔裸写——与 Rust push_csv_value_formatted 的
+          // Value 分发对齐；NULL 字面量沿用 necessary，裸 `\N` 才能被回读端识别。
+          if (quoteMode === "strings" && typeof cell !== "string") return String(cell);
+          return escapeCsvField(String(cell), quoteMode, delimiter, quoteChar);
+        })
+        .join(delimiter),
+    )
+    .join("\n");
   return includeHeader ? `${header}\n${body}` : body;
 }
 

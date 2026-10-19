@@ -87,6 +87,33 @@ pub struct SqlFileRequest {
     /// logging enabled, so the serde default is `true`.
     #[serde(default = "sql_file_failure_log_enabled_by_default")]
     pub failure_log_enabled: bool,
+    /// Text encoding used to decode SQL files. `auto` preserves the historical
+    /// BOM/UTF-8/GBK detection behavior.
+    #[serde(default)]
+    pub encoding: SqlFileEncoding,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum SqlFileEncoding {
+    #[default]
+    Auto,
+    Utf8,
+    Gbk,
+    Utf16Le,
+    Utf16Be,
+}
+
+impl SqlFileEncoding {
+    pub fn to_encoding(self) -> Option<&'static encoding_rs::Encoding> {
+        match self {
+            Self::Auto => None,
+            Self::Utf8 => Some(encoding_rs::UTF_8),
+            Self::Gbk => Some(encoding_rs::GBK),
+            Self::Utf16Le => Some(encoding_rs::UTF_16LE),
+            Self::Utf16Be => Some(encoding_rs::UTF_16BE),
+        }
+    }
 }
 
 fn sql_file_failure_log_enabled_by_default() -> bool {
@@ -178,6 +205,7 @@ struct SqlDialectProfile {
     supports_dollar_quoted_strings: bool,
     supports_postgres_dollar_quoted_routines: bool,
     supports_hana_script_blocks: bool,
+    supports_firebird_routine_blocks: bool,
     supports_go_batch_separator: bool,
     keeps_sqlserver_module_batch_at_cursor: bool,
     preserves_tdsql_leading_directives: bool,
@@ -202,6 +230,7 @@ impl Default for SqlDialectProfile {
             supports_dollar_quoted_strings: true,
             supports_postgres_dollar_quoted_routines: false,
             supports_hana_script_blocks: false,
+            supports_firebird_routine_blocks: false,
             supports_go_batch_separator: false,
             keeps_sqlserver_module_batch_at_cursor: false,
             preserves_tdsql_leading_directives: false,
@@ -266,6 +295,10 @@ impl SqlDialectProfile {
             return Self::sap_hana();
         }
 
+        if matches!(db_type, DatabaseType::Firebird) {
+            return Self::firebird();
+        }
+
         if matches!(db_type, DatabaseType::DuckDb) {
             return Self {
                 supports_backslash_escaped_quotes: false,
@@ -299,6 +332,7 @@ impl SqlDialectProfile {
                 | DatabaseType::Kingbase
                 | DatabaseType::Highgo
                 | DatabaseType::Uxdb
+                | DatabaseType::Gbase8c
                 | DatabaseType::Kwdb
         )
     }
@@ -363,6 +397,10 @@ impl SqlDialectProfile {
 
     fn sap_hana() -> Self {
         Self { supports_hana_script_blocks: true, ..Self::default() }
+    }
+
+    fn firebird() -> Self {
+        Self { supports_backslash_escaped_quotes: false, supports_firebird_routine_blocks: true, ..Self::default() }
     }
 
     fn is_mysql_compatible_database(db_type: DatabaseType) -> bool {
@@ -899,6 +937,13 @@ impl SqlStatementSplitter {
                         if hana_script_block_is_complete(&self.buffer) {
                             self.push_current_statement(&mut statements);
                         }
+                    } else if self.options.profile.supports_firebird_routine_blocks
+                        && starts_with_firebird_routine_block(&self.buffer)
+                    {
+                        self.buffer.push(ch);
+                        if firebird_routine_block_is_complete(&self.buffer) {
+                            self.push_current_statement(&mut statements);
+                        }
                     } else {
                         self.push_current_statement(&mut statements);
                     }
@@ -1286,6 +1331,9 @@ fn split_statement_range_at_blank_lines(
     if options.profile.supports_hana_script_blocks && starts_with_hana_script_block(&statement.text) {
         return vec![statement.clone()];
     }
+    if options.profile.supports_firebird_routine_blocks && starts_with_firebird_routine_block(&statement.text) {
+        return vec![statement.clone()];
+    }
 
     let mut ranges = Vec::new();
     let mut scanner = SqlScanner::with_profile(options.profile);
@@ -1335,6 +1383,11 @@ fn split_statement_range_at_blank_lines(
 fn starts_with_soft_statement_keyword(sql: &str, options: SqlParsingOptions) -> bool {
     if options.profile.supports_hana_script_blocks
         && starts_with_executable_sql_keyword_with_options(sql, &["DO"], options)
+    {
+        return true;
+    }
+    if options.profile.supports_firebird_routine_blocks
+        && starts_with_executable_sql_keyword_with_options(sql, &["RECREATE"], options)
     {
         return true;
     }
@@ -1539,6 +1592,14 @@ fn split_sql_statement_ranges_with_options(sql: &str, options: SqlParsingOptions
                         && starts_with_hana_script_block(&sql[start..i])
                     {
                         if !hana_script_block_is_complete(&sql[start..i + ch.len_utf8()]) {
+                            i += ch.len_utf8();
+                            continue;
+                        }
+                        push_statement_range(&mut ranges, sql, start, i + ch.len_utf8(), options);
+                    } else if options.profile.supports_firebird_routine_blocks
+                        && starts_with_firebird_routine_block(&sql[start..i])
+                    {
+                        if !firebird_routine_block_is_complete(&sql[start..i + ch.len_utf8()]) {
                             i += ch.len_utf8();
                             continue;
                         }
@@ -2986,6 +3047,11 @@ fn starts_with_hana_script_block(sql: &str) -> bool {
 }
 
 fn hana_script_block_is_complete(sql: &str) -> bool {
+    if let Some((_, last_line)) = sql.rsplit_once('\n') {
+        if !last_line.trim_start().to_ascii_uppercase().starts_with("END;") {
+            return false;
+        }
+    }
     HanaScriptBlock::parse(sql).is_complete()
 }
 
@@ -3032,39 +3098,133 @@ impl HanaScriptBlock {
             return false;
         }
 
-        let mut stack: Vec<String> = Vec::new();
+        let mut block_depth = 0usize;
+        let mut case_depth = 0usize;
         let mut saw_begin = false;
 
         for (index, token) in self.tokens.iter().enumerate() {
             if token.is_word("BEGIN") {
-                if previous_word_token(&self.tokens, index).is_some_and(|previous| previous == "END") {
+                if previous_adjacent_word(&self.tokens, index).is_some_and(|previous| previous == "END") {
                     continue;
                 }
-                stack.push("BLOCK".to_string());
+                block_depth += 1;
                 saw_begin = true;
                 continue;
             }
-            if token.is_any_word(&["IF", "FOR", "WHILE", "CASE"]) {
-                if previous_word_token(&self.tokens, index).is_none_or(|previous| previous != "END") {
-                    stack.push(token.as_word().unwrap_or("BLOCK").to_string());
+            if token.is_word("CASE") {
+                if previous_adjacent_word(&self.tokens, index).is_none_or(|previous| previous != "END") {
+                    case_depth += 1;
                 }
                 continue;
             }
             if token.is_word("END") {
-                let next = next_word_token(&self.tokens, index);
-                let top = stack.last().map(|value| value.as_str());
-                let target = match next {
-                    Some(keyword @ ("IF" | "FOR" | "WHILE")) => keyword,
-                    _ if top == Some("CASE") => "CASE",
-                    _ => "BLOCK",
-                };
-                if top == Some(target) {
-                    stack.pop();
+                let next = next_adjacent_word(&self.tokens, index);
+                if matches!(next, Some("IF" | "FOR" | "WHILE")) {
+                    continue;
+                }
+                if case_depth > 0 {
+                    case_depth -= 1;
+                } else {
+                    block_depth = block_depth.saturating_sub(1);
                 }
             }
         }
 
-        saw_begin && stack.is_empty() && self.tokens.last().is_some_and(OraclePlSqlToken::is_semicolon)
+        saw_begin
+            && block_depth == 0
+            && case_depth == 0
+            && self.tokens.last().is_some_and(OraclePlSqlToken::is_semicolon)
+    }
+}
+
+fn starts_with_firebird_routine_block(sql: &str) -> bool {
+    FirebirdRoutineBlock::parse(sql).starts_block()
+}
+
+fn firebird_routine_block_is_complete(sql: &str) -> bool {
+    FirebirdRoutineBlock::parse(sql).is_complete()
+}
+
+struct FirebirdRoutineBlock {
+    tokens: Vec<OraclePlSqlToken>,
+}
+
+impl FirebirdRoutineBlock {
+    fn parse(sql: &str) -> Self {
+        Self { tokens: oracle_plsql_tokens(sql) }
+    }
+
+    fn starts_block(&self) -> bool {
+        let Some(first) = self.tokens.first().and_then(OraclePlSqlToken::as_word) else {
+            return false;
+        };
+        if first == "EXECUTE" {
+            return self.tokens.get(1).is_some_and(|token| token.is_word("BLOCK"));
+        }
+        if !matches!(first, "CREATE" | "RECREATE" | "ALTER") {
+            return false;
+        }
+        let mut index = 1;
+        if self.tokens.get(index).is_some_and(|token| token.is_word("OR"))
+            && self.tokens.get(index + 1).is_some_and(|token| token.is_any_word(&["ALTER", "REPLACE"]))
+        {
+            index += 2;
+        }
+        let Some(object_type) = self.tokens.get(index).and_then(OraclePlSqlToken::as_word) else {
+            return false;
+        };
+        if object_type == "PACKAGE" {
+            if !self.tokens.get(index + 1).is_some_and(|token| token.is_word("BODY")) {
+                return false;
+            }
+        } else if !matches!(object_type, "PROCEDURE" | "FUNCTION" | "TRIGGER") {
+            return false;
+        }
+        if first == "ALTER" {
+            // Firebird accepts `ALTER TRIGGER name ACTIVE/INACTIVE;`. Only treat ALTER
+            // as a routine block when it defines a body via AS or BEGIN.
+            return self.tokens.iter().any(|token| token.is_any_word(&["AS", "BEGIN"]));
+        }
+        true
+    }
+
+    fn is_complete(&self) -> bool {
+        if !self.starts_block() {
+            return false;
+        }
+
+        let mut block_depth = 0usize;
+        let mut case_depth = 0usize;
+        let mut saw_begin = false;
+
+        for (index, token) in self.tokens.iter().enumerate() {
+            if token.is_word("BEGIN") {
+                if previous_adjacent_word(&self.tokens, index).is_some_and(|previous| previous == "END") {
+                    continue;
+                }
+                block_depth += 1;
+                saw_begin = true;
+                continue;
+            }
+            if token.is_word("CASE") {
+                if previous_adjacent_word(&self.tokens, index).is_none_or(|previous| previous != "END") {
+                    case_depth += 1;
+                }
+                continue;
+            }
+            if token.is_word("END") {
+                if case_depth > 0 {
+                    case_depth -= 1;
+                } else {
+                    block_depth = block_depth.saturating_sub(1);
+                }
+            }
+        }
+
+        saw_begin
+            && block_depth == 0
+            && case_depth == 0
+            && self.tokens.last().is_some_and(OraclePlSqlToken::is_semicolon)
     }
 }
 
@@ -3083,6 +3243,9 @@ enum OraclePlSqlToken {
     /// the server rejected the truncated statement (#10434).
     QuotedIdentifier,
     Semicolon,
+    /// Punctuation / operators / numbers. Kept so `end ), (case` is not treated as the
+    /// PL/SQL closer `END CASE` (adjacent-word checks must not skip across these).
+    Other,
 }
 
 impl OraclePlSqlBlock {
@@ -3209,11 +3372,12 @@ impl OraclePlSqlBlock {
             } else if token.is_word("CASE") {
                 // Both CASE expressions and CASE statements own an END.
                 // The CASE token that follows END CASE is a suffix, not a scope start.
-                if previous_word_token(&self.tokens, index) != Some("END") {
+                // Require source adjacency: `end ), (case` must open a new CASE scope.
+                if previous_adjacent_word(&self.tokens, index) != Some("END") {
                     scopes.push(OraclePlSqlScope::Case);
                 }
             } else if token.is_word("END") {
-                let next = self.tokens.get(index + 1).and_then(OraclePlSqlToken::as_word);
+                let next = next_adjacent_word(&self.tokens, index);
                 if matches!(next, Some("IF" | "LOOP")) {
                     continue;
                 }
@@ -3277,11 +3441,11 @@ impl OraclePlSqlBlock {
 
             match word {
                 "BEGIN" => scopes.push(OraclePlSqlScope::Block),
-                "CASE" if previous_word_token(&self.tokens, index) != Some("END") => {
+                "CASE" if previous_adjacent_word(&self.tokens, index) != Some("END") => {
                     scopes.push(OraclePlSqlScope::Case);
                 }
                 "END" => {
-                    let next = self.tokens.get(index + 1).and_then(OraclePlSqlToken::as_word);
+                    let next = next_adjacent_word(&self.tokens, index);
                     if matches!(next, Some("IF" | "LOOP")) {
                         continue;
                     }
@@ -3403,7 +3567,8 @@ impl OraclePlSqlToken {
             Token::Word(word) if word.quote_style.is_none() => Some(Self::Word(word.value.to_ascii_uppercase())),
             Token::Word(_) => Some(Self::QuotedIdentifier),
             Token::SemiColon => Some(Self::Semicolon),
-            _ => None,
+            Token::Whitespace(_) | Token::Placeholder(_) => None,
+            _ => Some(Self::Other),
         }
     }
 
@@ -3414,7 +3579,7 @@ impl OraclePlSqlToken {
     fn as_word(&self) -> Option<&str> {
         match self {
             Self::Word(value) => Some(value),
-            Self::QuotedIdentifier | Self::Semicolon => None,
+            Self::QuotedIdentifier | Self::Semicolon | Self::Other => None,
         }
     }
 
@@ -3427,18 +3592,36 @@ impl OraclePlSqlToken {
     }
 }
 
-fn previous_word_token(tokens: &[OraclePlSqlToken], index: usize) -> Option<&str> {
-    tokens[..index].iter().rev().find_map(OraclePlSqlToken::as_word)
+/// Word immediately before `index` in the token stream (no skipping punctuation).
+/// Used for `END CASE` / `END IF` pairing so `end ), (case` is not treated as `END CASE`.
+fn previous_adjacent_word(tokens: &[OraclePlSqlToken], index: usize) -> Option<&str> {
+    index.checked_sub(1).and_then(|previous| tokens.get(previous)).and_then(OraclePlSqlToken::as_word)
 }
 
-fn next_word_token(tokens: &[OraclePlSqlToken], index: usize) -> Option<&str> {
-    tokens[index + 1..].iter().find_map(OraclePlSqlToken::as_word)
+fn next_adjacent_word(tokens: &[OraclePlSqlToken], index: usize) -> Option<&str> {
+    tokens.get(index + 1).and_then(OraclePlSqlToken::as_word)
+}
+
+fn push_other_token(tokens: &mut Vec<OraclePlSqlToken>) {
+    if tokens.last() != Some(&OraclePlSqlToken::Other) {
+        tokens.push(OraclePlSqlToken::Other);
+    }
 }
 
 fn oracle_plsql_tokens(sql: &str) -> Vec<OraclePlSqlToken> {
     let dialect = OracleDialect {};
     if let Ok(tokens) = Tokenizer::new(&dialect, sql).tokenize() {
-        return tokens.into_iter().filter_map(OraclePlSqlToken::from_sqlparser_token).collect();
+        let mut out = Vec::new();
+        for token in tokens {
+            if let Some(mapped) = OraclePlSqlToken::from_sqlparser_token(token) {
+                if mapped == OraclePlSqlToken::Other {
+                    push_other_token(&mut out);
+                } else {
+                    out.push(mapped);
+                }
+            }
+        }
+        return out;
     }
 
     oracle_plsql_tokens_fallback(sql)
@@ -3485,6 +3668,8 @@ fn oracle_plsql_tokens_fallback(sql: &str) -> Vec<OraclePlSqlToken> {
                     }
                 }
             }
+            // String literals separate keywords the same way punctuation does.
+            push_other_token(&mut tokens);
             continue;
         }
 
@@ -3515,7 +3700,10 @@ fn oracle_plsql_tokens_fallback(sql: &str) -> Vec<OraclePlSqlToken> {
                 }
             }
             tokens.push(OraclePlSqlToken::word(token));
+            continue;
         }
+
+        push_other_token(&mut tokens);
     }
 
     tokens
@@ -4968,6 +5156,7 @@ SELECT 2;";
         assert!(!default.supports_oracle_plsql_blocks);
         assert!(!default.supports_oracle_style_routine_bodies);
         assert!(!default.supports_hana_script_blocks);
+        assert!(!default.supports_firebird_routine_blocks);
         assert!(!default.supports_slash_line_block_delimiter);
         assert!(!default.supports_go_batch_separator);
         assert!(!default.keeps_sqlserver_module_batch_at_cursor);
@@ -5044,6 +5233,11 @@ SELECT 2;";
         let sap_hana = SqlDialectProfile::for_database_type(DatabaseType::SapHana);
         assert_eq!(sap_hana, SqlDialectProfile::sap_hana());
         assert!(sap_hana.supports_hana_script_blocks);
+
+        let firebird = SqlDialectProfile::for_database_type(DatabaseType::Firebird);
+        assert_eq!(firebird, SqlDialectProfile::firebird());
+        assert!(firebird.supports_firebird_routine_blocks);
+        assert!(!firebird.supports_backslash_escaped_quotes);
     }
 
     #[test]
@@ -5075,6 +5269,26 @@ SELECT 2 FROM DUMMY;";
     }
 
     #[test]
+    fn sap_hana_split_keeps_nested_case_group_by_inside_procedure_together() {
+        let sql = "ALTER PROCEDURE PUBLIC.P\nLANGUAGE SQLSCRIPT\nSQL SECURITY INVOKER\nAS\nBEGIN\n  T = SELECT 1 FROM DUMMY\n  GROUP BY\n    CASE WHEN KHLX='老客' THEN CASE WHEN SCYEAR='0000' THEN NULL ELSE SCYEAR END ELSE LEFT(CASE WHEN SCDAT_OLD='00000000' THEN NULL ELSE SCDAT_OLD END,4) END,\n    CASE WHEN KHLX='老客' THEN CASE WHEN SCDAT='00000000' THEN NULL ELSE SCDAT END ELSE (CASE WHEN SCDAT_OLD='00000000' THEN NULL ELSE SCDAT_OLD END)END;\nEND;\nSELECT 2 FROM DUMMY;";
+
+        assert_eq!(
+            split_sql_statements_for_database(sql, DatabaseType::SapHana),
+            vec![sql[..sql.rfind("\nSELECT 2").unwrap()].to_string(), "SELECT 2 FROM DUMMY".to_string()]
+        );
+    }
+
+    #[test]
+    fn sap_hana_split_handles_single_line_and_lowercase_end() {
+        for sql in [
+            "DO BEGIN T = SELECT CASE WHEN 1 = 1 THEN 1 ELSE 0 END FROM DUMMY; END;",
+            "do begin t = select 1 from dummy; end;",
+        ] {
+            assert_eq!(split_sql_statements_for_database(sql, DatabaseType::SapHana), vec![sql.to_string()]);
+        }
+    }
+
+    #[test]
     fn sap_hana_plain_alter_procedure_still_flushes_at_semicolon() {
         assert_eq!(
             split_sql_statements_for_database(
@@ -5100,6 +5314,134 @@ SELECT 2 FROM DUMMY;";
         assert_eq!(
             find_statement_at_cursor_for_database(sql, cursor, DatabaseType::SapHana),
             "DO\nBEGIN\n  IF 1 = 1 THEN\n    SELECT CASE WHEN 1 = 1 THEN 1 ELSE 0 END AS \"Result\" FROM DUMMY;\n  END IF;\nEND;"
+        );
+    }
+
+    #[test]
+    fn firebird_split_keeps_trigger_block_together() {
+        let sql = "\
+CREATE OR ALTER TRIGGER \"WL_FYD_TP_AU\" FOR \"WL_FYD\" ACTIVE
+AFTER UPDATE
+as
+begin
+  /* Trigger text */
+  IF ( COALESCE(NEW.QSTPS,0) <> COALESCE(OLD.QSTPS,0) ) THEN
+  BEGIN
+    UPDATE WL_FYD SET ZT='完成' WHERE ID= NEW.ID;
+  END
+end;
+SELECT 2 FROM RDB$DATABASE;";
+
+        assert_eq!(
+            split_sql_statements_for_database(sql, DatabaseType::Firebird),
+            vec![
+                "CREATE OR ALTER TRIGGER \"WL_FYD_TP_AU\" FOR \"WL_FYD\" ACTIVE\nAFTER UPDATE\nas\nbegin\n  /* Trigger text */\n  IF ( COALESCE(NEW.QSTPS,0) <> COALESCE(OLD.QSTPS,0) ) THEN\n  BEGIN\n    UPDATE WL_FYD SET ZT='完成' WHERE ID= NEW.ID;\n  END\nend;",
+                "SELECT 2 FROM RDB$DATABASE"
+            ]
+        );
+    }
+
+    #[test]
+    fn firebird_split_keeps_procedure_with_declarations_together() {
+        let sql = "\
+CREATE OR ALTER PROCEDURE SP_GET_USER (USER_ID INT)
+RETURNS (USERNAME VARCHAR(50), TOTAL_AMOUNT NUMERIC(18, 2))
+AS
+DECLARE VARIABLE V_TEMP NUMERIC(18, 2);
+DECLARE VARIABLE V_STATUS INT;
+BEGIN
+  SELECT FIRST 1 NAME FROM USERS WHERE ID = :USER_ID INTO :USERNAME;
+  V_TEMP = 100.50;
+  TOTAL_AMOUNT = :V_TEMP;
+  SUSPEND;
+END;
+SELECT 1 FROM RDB$DATABASE;";
+
+        assert_eq!(
+            split_sql_statements_for_database(sql, DatabaseType::Firebird),
+            vec![
+                "CREATE OR ALTER PROCEDURE SP_GET_USER (USER_ID INT)\nRETURNS (USERNAME VARCHAR(50), TOTAL_AMOUNT NUMERIC(18, 2))\nAS\nDECLARE VARIABLE V_TEMP NUMERIC(18, 2);\nDECLARE VARIABLE V_STATUS INT;\nBEGIN\n  SELECT FIRST 1 NAME FROM USERS WHERE ID = :USER_ID INTO :USERNAME;\n  V_TEMP = 100.50;\n  TOTAL_AMOUNT = :V_TEMP;\n  SUSPEND;\nEND;",
+                "SELECT 1 FROM RDB$DATABASE"
+            ]
+        );
+    }
+
+    #[test]
+    fn firebird_split_keeps_execute_block_together() {
+        let sql = "\
+EXECUTE BLOCK
+RETURNS (OUT_ID INT)
+AS
+DECLARE VARIABLE I INT;
+BEGIN
+  I = 0;
+  WHILE (I < 10) DO
+  BEGIN
+    I = I + 1;
+  END
+  OUT_ID = I;
+  SUSPEND;
+END;
+SELECT 1 FROM RDB$DATABASE;";
+
+        assert_eq!(
+            split_sql_statements_for_database(sql, DatabaseType::Firebird),
+            vec![
+                "EXECUTE BLOCK\nRETURNS (OUT_ID INT)\nAS\nDECLARE VARIABLE I INT;\nBEGIN\n  I = 0;\n  WHILE (I < 10) DO\n  BEGIN\n    I = I + 1;\n  END\n  OUT_ID = I;\n  SUSPEND;\nEND;",
+                "SELECT 1 FROM RDB$DATABASE"
+            ]
+        );
+    }
+
+    #[test]
+    fn firebird_split_keeps_routine_with_case_expression_together() {
+        let sql = "\
+CREATE PROCEDURE P_CASE
+AS
+BEGIN
+  UPDATE T SET FLAG = CASE WHEN X > 0 THEN 1 ELSE 0 END;
+END;
+SELECT 1 FROM RDB$DATABASE;";
+
+        assert_eq!(
+            split_sql_statements_for_database(sql, DatabaseType::Firebird),
+            vec![
+                "CREATE PROCEDURE P_CASE\nAS\nBEGIN\n  UPDATE T SET FLAG = CASE WHEN X > 0 THEN 1 ELSE 0 END;\nEND;",
+                "SELECT 1 FROM RDB$DATABASE"
+            ]
+        );
+    }
+
+    #[test]
+    fn firebird_plain_alter_trigger_still_flushes_at_semicolon() {
+        assert_eq!(
+            split_sql_statements_for_database(
+                "ALTER TRIGGER TR_USERS INACTIVE; SELECT 1 FROM RDB$DATABASE;",
+                DatabaseType::Firebird
+            ),
+            vec!["ALTER TRIGGER TR_USERS INACTIVE", "SELECT 1 FROM RDB$DATABASE"]
+        );
+    }
+
+    #[test]
+    fn firebird_cursor_statement_returns_whole_trigger() {
+        let sql = "\
+CREATE OR ALTER TRIGGER \"WL_FYD_TP_AU\" FOR \"WL_FYD\" ACTIVE
+AFTER UPDATE
+as
+begin
+  /* Trigger text */
+  IF ( COALESCE(NEW.QSTPS,0) <> COALESCE(OLD.QSTPS,0) ) THEN
+  BEGIN
+    UPDATE WL_FYD SET ZT='完成' WHERE ID= NEW.ID;
+  END
+end;
+SELECT 2 FROM RDB$DATABASE;";
+        let cursor = sql.find("UPDATE WL_FYD").unwrap();
+
+        assert_eq!(
+            find_statement_at_cursor_for_database(sql, cursor, DatabaseType::Firebird),
+            "CREATE OR ALTER TRIGGER \"WL_FYD_TP_AU\" FOR \"WL_FYD\" ACTIVE\nAFTER UPDATE\nas\nbegin\n  /* Trigger text */\n  IF ( COALESCE(NEW.QSTPS,0) <> COALESCE(OLD.QSTPS,0) ) THEN\n  BEGIN\n    UPDATE WL_FYD SET ZT='完成' WHERE ID= NEW.ID;\n  END\nend;"
         );
     }
 
@@ -6371,6 +6713,31 @@ SELECT 1;";
                     "SELECT 1"
                 ]
             );
+        }
+    }
+
+    #[test]
+    fn oracle_like_split_keeps_decode_consecutive_case_expressions_inside_procedure() {
+        // Punctuation between `end` and the next `case` must not look like PL/SQL `END CASE`,
+        // or CREATE PROCEDURE is truncated at the INSERT terminator (OceanBase OBE-00900 near insert).
+        let procedure = "\
+CREATE OR REPLACE PROCEDURE dm.sp_demo IS
+BEGIN
+  INSERT INTO t(c)
+  SELECT decode(
+    company_no,
+    'A', (case when x = 1 then 'one' else 'other' end),
+    'B', (case when y = 2 then 'two' else 'other' end)
+  ) as business_type_name
+  FROM src;
+  COMMIT;
+EXCEPTION
+  WHEN OTHERS THEN
+    NULL;
+END sp_demo;";
+
+        for database in [DatabaseType::Oracle, DatabaseType::OceanbaseOracle] {
+            assert_eq!(split_sql_statements_for_database(procedure, database), vec![procedure.to_string()]);
         }
     }
 

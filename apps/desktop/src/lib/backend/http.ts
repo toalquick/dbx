@@ -1,3 +1,4 @@
+import type { SqlFileEncoding } from "./tauri";
 import type { StarRocksAlterOptions } from "@/lib/table/starrocksAlterOptions";
 import type { CreateTableDialectOptions } from "@/lib/table/starrocksPhysicalOptions";
 import type { MongoDumpFormat, MongoDumpSourceInput, MongoDumpCatalog, MongoRestoreSourcePreview, MongoDatabaseDumpRequest, MongoDatabaseRestoreRequest, MongoDatabaseDumpProgress } from "./mongodbDumpTypes";
@@ -91,7 +92,7 @@ import type { CollectionInfo } from "@/types/database";
 import type { SchemaDiffPreparation, SchemaDiffPreparationOptions, SchemaSyncSqlPlan, SelectedSchemaDiffInput, GenerateSchemaSyncPlanOptions, TableDiff, FunctionDiff, SequenceDiff, RuleDiff, OwnerDiff } from "@/lib/schema/schemaDiff";
 import type { SidebarObjectKind } from "@/lib/database/databaseObjectCapabilities";
 import type { AiConfig, AiTestConnectionResult } from "@/stores/settingsStore";
-import type { AiChatSelectionState, AiEffortCapability } from "@/types/ai";
+import type { AiChatSelectionState, AiEffortCapability, CopilotDevicePollResult, CopilotDeviceStartResult, CopilotUser } from "@/types/ai";
 import type { SalesforceCurrentUser, SalesforceOAuthAuthorizeParams, SalesforceOAuthDevicePollResult, SalesforceOAuthDeviceStartResult, SalesforceOAuthRefreshResult, SalesforceOAuthToken } from "@/types/salesforce";
 import type {
   AgentDriverInfo,
@@ -262,6 +263,7 @@ import type { DataCompareFromTablesOptions, DataCompareFromTablesPreparation, Da
 import { apiUrl, apiWebSocketUrl } from "@/lib/common/webPath";
 import type {
   ActivePluginSession,
+  ConnectionIdleClosedEvent,
   ConnectionLivenessMessage,
   PluginBinaryEvent,
   PluginConnectionActionResult,
@@ -821,6 +823,19 @@ export async function subscribeConnectionLiveness(onEvent: (event: ConnectionLiv
   const source = new EventSource(apiUrl("/api/connection/liveness-events"));
   source.onmessage = (message) => {
     onEvent(JSON.parse(message.data) as ConnectionLivenessMessage);
+  };
+  return () => source.close();
+}
+
+/**
+ * 「空闲自动断开」事件（issue #12112）：后端在某个连接的连接池因空闲超过
+ * `idle_disconnect_secs` 被关闭时下发。与 liveness 一样走 SSE，载荷也是同一份
+ * `{ connectionId }`，因此前端在 desktop（Tauri 事件）与 web 两种传输上解析同一种结构。
+ */
+export async function subscribeConnectionIdleClosed(onEvent: (event: ConnectionIdleClosedEvent) => void): Promise<() => void> {
+  const source = new EventSource(apiUrl("/api/connection/idle-closed-events"));
+  source.onmessage = (message) => {
+    onEvent(JSON.parse(message.data) as ConnectionIdleClosedEvent);
   };
   return () => source.close();
 }
@@ -1659,7 +1674,7 @@ export interface SnapshotExportRequest {
   columns: string[];
   rows: unknown[][];
   cells: Array<{ rowIndex: number; columnIndex: number; valueRef: string }>;
-  quoteMode?: "all" | "necessary";
+  quoteMode?: CsvQuoteMode;
   nullLiteral?: string | null;
 }
 
@@ -2216,6 +2231,18 @@ export async function aiTestConnection(config: AiConfig): Promise<AiTestConnecti
   return post("/api/ai/test-connection", { config });
 }
 
+export async function copilotDeviceStart(): Promise<CopilotDeviceStartResult> {
+  return post("/api/ai/copilot-device-start", {});
+}
+
+export async function copilotDevicePoll(deviceCode: string, intervalSecs: number): Promise<CopilotDevicePollResult> {
+  return post("/api/ai/copilot-device-poll", { deviceCode, intervalSecs });
+}
+
+export async function copilotCurrentUser(accessToken: string): Promise<CopilotUser> {
+  return post("/api/ai/copilot-current-user", { accessToken });
+}
+
 export async function aiListModels(config: AiConfig): Promise<AiModelInfo[]> {
   return post("/api/ai/models", { config });
 }
@@ -2361,6 +2388,10 @@ export async function deleteAiConfig(configId: string): Promise<void> {
 
 export async function loadCcSwitchAiConfigs(): Promise<import("@/types/ai").CcSwitchImportResult> {
   throw new Error("ccSwitchImportDesktopOnly");
+}
+
+export async function loadMagpieAiConfigs(): Promise<import("@/types/ai").CcSwitchImportResult> {
+  throw new Error("magpieImportDesktopOnly");
 }
 
 export async function loadDesktopSettings(): Promise<DesktopSettings> {
@@ -2687,6 +2718,8 @@ export interface SnippetSyncSummary {
   bytes: number;
   exportedAt?: string;
   appVersion?: string;
+  remoteContentHash?: string;
+  unchanged: boolean;
   legacyCleanupRequiredId?: string;
 }
 
@@ -2699,6 +2732,10 @@ export interface SnippetDownloadResult {
 
 export interface SnippetTokenStatus {
   hasSavedToken: boolean;
+}
+
+export interface SnippetPassphraseStatus {
+  hasSavedPassphrase: boolean;
 }
 
 export async function webdavSyncTest(config: WebDavConfig): Promise<void> {
@@ -2782,6 +2819,18 @@ export async function forgetSnippetSavedToken(config: SnippetSyncConfig): Promis
   await post("/api/cloud-sync/snippet/forget-token", { config });
 }
 
+export async function snippetPassphraseStatus(config: SnippetSyncConfig): Promise<SnippetPassphraseStatus> {
+  return post("/api/cloud-sync/snippet/passphrase-status", { config });
+}
+
+export async function saveSnippetSavedPassphrase(config: SnippetSyncConfig, passphrase: string): Promise<void> {
+  await post("/api/cloud-sync/snippet/save-passphrase", { config, passphrase });
+}
+
+export async function forgetSnippetSavedPassphrase(config: SnippetSyncConfig): Promise<void> {
+  await post("/api/cloud-sync/snippet/forget-passphrase", { config });
+}
+
 export async function snippetSyncSettings(provider: SnippetProvider, instanceUrl?: string): Promise<SnippetSyncSettings> {
   return post("/api/cloud-sync/snippet/settings", { provider, instanceUrl });
 }
@@ -2798,7 +2847,7 @@ export async function snippetSyncInspect(config: SnippetSyncConfig, snippetPassp
   return post("/api/cloud-sync/snippet/inspect", { config, snippetPassphrase, secretsPassphrase });
 }
 
-export async function snippetSyncUpload(config: SnippetSyncConfig, editorSettings?: unknown, snippetPassphrase?: string, includeSecrets = false, secretsPassphrase?: string, selection?: SyncSelection): Promise<SnippetSyncSummary> {
+export async function snippetSyncUpload(config: SnippetSyncConfig, editorSettings?: unknown, snippetPassphrase?: string, includeSecrets = false, secretsPassphrase?: string, selection?: SyncSelection, expectedRemoteContentHash?: string): Promise<SnippetSyncSummary> {
   return post("/api/cloud-sync/snippet/upload", {
     config,
     editorSettings,
@@ -2806,6 +2855,7 @@ export async function snippetSyncUpload(config: SnippetSyncConfig, editorSetting
     includeSecrets,
     secretsPassphrase,
     selection,
+    expectedRemoteContentHash,
   });
 }
 
@@ -2885,19 +2935,23 @@ export async function setAiGlobalCustomInstructions(content: string): Promise<vo
 // SQL File Execution
 // ---------------------------------------------------------------------------
 
-export async function previewSqlFile(fileOrPath: string | File): Promise<SqlFilePreview> {
+export async function previewSqlFile(fileOrPath: string | File, encoding?: SqlFileEncoding): Promise<SqlFilePreview> {
   if (typeof fileOrPath === "string") {
     // In web mode a raw path is not useful; throw a clear error
     throw new Error("previewSqlFile in web mode requires a File object, not a file path");
   }
   const formData = new FormData();
   formData.append("file", fileOrPath);
-  const res = await fetch(apiUrl("/api/sql-file/preview"), {
+  const res = await fetch(apiUrl(`/api/sql-file/preview${encoding ? `?encoding=${encodeURIComponent(encoding)}` : ""}`), {
     method: "POST",
     body: formData,
   });
   if (!res.ok) throw await backendResponseError(res);
   return res.json();
+}
+
+export async function refreshSqlFilePreview(filePath: string, encoding: SqlFileEncoding): Promise<Pick<SqlFilePreview, "preview" | "canExecuteWithoutSelectedDatabase" | "establishesDatabaseContext">> {
+  return post("/api/sql-file/preview/refresh", { filePath, encoding });
 }
 
 export async function releaseSqlFilePreview(cleanupToken: string): Promise<void> {
@@ -2935,8 +2989,8 @@ export async function executeSqlFile(request: SqlFileRequest): Promise<void> {
   return post("/api/sql-file/execute", { request });
 }
 
-export async function inspectSqlFileTables(filePath: string): Promise<SqlFileTable[]> {
-  return post("/api/sql-file/tables", { filePath });
+export async function inspectSqlFileTables(filePath: string, encoding?: SqlFileEncoding): Promise<SqlFileTable[]> {
+  return post("/api/sql-file/tables", { filePath, encoding });
 }
 
 export async function executeSqlFiles(request: SqlFileRequest, filePaths: string[]): Promise<void> {
@@ -3076,11 +3130,12 @@ export async function saveGlobalSearchSettings(settings: GlobalSearchSettings): 
 // ---------------------------------------------------------------------------
 
 export async function startTransfer(request: TransferRequest, onProgress: (progress: TransferProgress) => void, onStarted?: () => void): Promise<void> {
+  const { operationTimeoutSecs, ...backendRequest } = request;
   // 1. POST to start the transfer
   const res = await fetch(apiUrl("/api/transfer/start"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ request }),
+    body: JSON.stringify({ request: backendRequest, operationTimeoutSecs }),
   });
   if (!res.ok) throw await backendResponseError(res);
   onStarted?.();
@@ -3816,8 +3871,8 @@ export async function redisScanValues(connectionId: string, db: number, cursor: 
   });
 }
 
-export async function redisGetValue(connectionId: string, db: number, keyRaw: string): Promise<RedisValue> {
-  return post("/api/redis/get-value", { connectionId, db, keyRaw });
+export async function redisGetValue(connectionId: string, db: number, keyRaw: string, previewLimitBytes?: number): Promise<RedisValue> {
+  return post("/api/redis/get-value", { connectionId, db, keyRaw, previewLimitBytes });
 }
 
 export async function redisGetRawValue(connectionId: string, db: number, keyRaw: string): Promise<RedisBlob> {
@@ -5594,6 +5649,14 @@ export async function checkMcpServerStatus(): Promise<import("@/lib/backend/taur
     uninstall_command: "npm uninstall -g @dbx-app/mcp-server",
     error: "MCP Server status is only available in the desktop app.",
   };
+}
+
+export async function checkMcpKeychainAccess(): Promise<import("@/lib/backend/tauri").McpKeychainAccess> {
+  return "not_applicable";
+}
+
+export async function authorizeMcpKeychain(): Promise<string> {
+  throw new Error("MCP Keychain authorization is only available in the desktop app.");
 }
 
 export async function installMcpServer(): Promise<string> {

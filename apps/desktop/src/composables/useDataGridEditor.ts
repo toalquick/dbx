@@ -1,4 +1,5 @@
 import { joinedSaveOptions } from "@/lib/dataGrid/joinedRowChanges";
+import { isAiPromptImeCompositionEvent } from "@/lib/ai/aiPromptKeyboard";
 import { ref, shallowRef, triggerRef, computed, nextTick, watch, getCurrentInstance, onActivated, onBeforeUnmount, onDeactivated, onMounted, toRaw, type ComputedRef, type Ref } from "vue";
 import * as api from "@/lib/backend/api";
 import type { DataGridSaveGuard } from "@/lib/backend/tauri";
@@ -314,12 +315,15 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   function cloneNewRowMeta(meta: readonly GridNewRowMeta[]): GridNewRowMeta[] {
     return toRaw(meta).map((entry) => {
       const item = toRaw(entry);
-      return { token: item.token, placement: item.placement ? { ...toRaw(item.placement) } : null, sourceIndex: item.sourceIndex, editedColumns: item.editedColumns ? [...toRaw(item.editedColumns)] : undefined };
+      const cloned: GridNewRowMeta = { token: item.token, placement: item.placement ? { ...toRaw(item.placement) } : null, sourceIndex: item.sourceIndex, editedColumns: item.editedColumns ? [...toRaw(item.editedColumns)] : undefined };
+      if (item.untouched === true) cloned.untouched = true;
+      return cloned;
     });
   }
 
-  function updateClonedRowEditedColumns(newIndex: number, col: number, value: CellValue) {
+  function updateNewRowEditedColumns(newIndex: number, col: number, value: CellValue) {
     const meta = newRowMeta.value[newIndex];
+    if (meta) delete meta.untouched;
     if (!meta || meta.sourceIndex === undefined) return;
     const baseline = result.value.rows[meta.sourceIndex]?.[col];
     const edited = new Set(meta.editedColumns);
@@ -406,7 +410,9 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   }
 
   const dirtyRowCount = computed(() => dirtyRows.value.size);
-  const newRowCount = computed(() => newRows.value.length);
+  // Untouched blank rows are layout placeholders. They remain available for
+  // editing, but do not represent a change that can be submitted.
+  const newRowCount = computed(() => newRows.value.reduce((count, row, index) => count + (isUntouchedNewRow(row, index) ? 0 : 1), 0));
   const deletedRowCount = computed(() => deletedRows.value.size);
   const pendingChangeCount = computed(() => dirtyRowCount.value + newRowCount.value + deletedRowCount.value);
   const hasPendingChanges = computed(() => pendingChangeCount.value > 0);
@@ -419,6 +425,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   const isSaving = ref(false);
   const saveError = ref("");
   const saveWarning = ref("");
+  const previewValidationMessage = ref("");
   const conditionalUpdateExecution = shallowRef<ConditionalUpdateExecution>();
   const isConditionalUpdateActive = computed(() => conditionalUpdateExecution.value !== undefined);
 
@@ -486,6 +493,9 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     // Save errors/warnings describe the completed save that produced them. They
     // stay until the next save starts (or the user dismisses the card) — typing
     // after a failure must not hide what the database reported.
+    // Preview validation describes the previous pending snapshot; edits,
+    // undo/redo, and rollback make it stale.
+    previewValidationMessage.value = "";
     pendingChangesVersion.value++;
   }
 
@@ -979,7 +989,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       if (changed) pushUndoSnapshot();
       if (newRows.value[item.newIndex]) {
         newRows.value[item.newIndex][col] = newVal;
-        updateClonedRowEditedColumns(item.newIndex, col, newVal);
+        if (changed) updateNewRowEditedColumns(item.newIndex, col, newVal);
       }
       newRows.value = [...newRows.value];
       newRowMeta.value = [...newRowMeta.value];
@@ -1099,7 +1109,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
         pushUndoSnapshot();
       }
       row[col] = newVal;
-      updateClonedRowEditedColumns(item.newIndex, col, newVal);
+      updateNewRowEditedColumns(item.newIndex, col, newVal);
       markBatchMutated();
       if (!isBatching) {
         newRows.value = [...newRows.value];
@@ -1183,45 +1193,60 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     }
   }
 
-  function restoreCellValue(rowId: number, col: number) {
-    if (!canEditColumn(col)) return;
+  // 返回「是否真的回退了内容」。网格焦点下的 Esc（#11634）只有在确有改动被回退时才消费按键。
+  function restoreCellValue(rowId: number, col: number): boolean {
+    if (!canEditColumn(col)) return false;
     const item = getRowItem(rowId);
-    if (!item || item.isDeleted) return;
+    if (!item || item.isDeleted) return false;
 
     if (item.isDraft) {
       ensureQuickEntryDraftRow();
-      if (quickEntryDraftRow.value[col] === null) return;
+      if (quickEntryDraftRow.value[col] === null) return false;
       pushUndoSnapshot();
       const nextDraftRow = [...quickEntryDraftRow.value];
       nextDraftRow[col] = null;
       quickEntryDraftRow.value = draftRowHasValue(nextDraftRow) ? nextDraftRow : emptyDraftRow();
       touchPendingChanges();
-      return;
+      return true;
     }
 
     if (item.isNew && item.newIndex !== undefined) {
-      if (isSavingNewRow(item)) return;
+      if (isSavingNewRow(item)) return false;
       const row = newRows.value[item.newIndex];
-      if (!row || row[col] === null) return;
+      if (!row || row[col] === null) return false;
       pushUndoSnapshot();
       row[col] = null;
-      updateClonedRowEditedColumns(item.newIndex, col, null);
+      updateNewRowEditedColumns(item.newIndex, col, null);
       newRows.value = [...newRows.value];
       newRowMeta.value = [...newRowMeta.value];
       touchPendingChanges();
-      return;
+      return true;
     }
 
-    if (item.sourceIndex === undefined) return;
-    if (!canEditExistingRows.value) return;
+    if (item.sourceIndex === undefined) return false;
+    if (!canEditExistingRows.value) return false;
     const rowChanges = dirtyRows.value.get(item.sourceIndex);
-    if (!rowChanges?.has(col)) return;
+    if (!rowChanges?.has(col)) return false;
     pushUndoSnapshot();
     rowChanges.delete(col);
     if (rowChanges.size === 0) dirtyRows.value.delete(item.sourceIndex);
     dirtyRows.value = new Map(dirtyRows.value);
     touchPendingChanges();
     onCellValueChanged?.(rowId, col);
+    return true;
+  }
+
+  // #11634：Esc 取消「刚新增且从未写入」的待插入行。这类行不进 INSERT 批次
+  // （snapshotPendingSaveChanges 会跳过 untouched 行），因此撤掉它等于整体取消这次新增。
+  // 「填写过再清空」的行在首次提交时就被 updateNewRowEditedColumns 摘掉了 untouched 标记，
+  // 不在取消之列——它们必须保留在保存预览里（useDataGridEditor.spec.ts 锁定了该语义）。
+  function cancelUntouchedPendingRow(rowId: number): boolean {
+    const item = getRowItem(rowId);
+    if (!item?.isNew || item.newIndex === undefined) return false;
+    if (isSavingNewRow(item) || !isUntouchedNewRow(item.data, item.newIndex)) return false;
+    // 走既有的未触碰行删除路径：免二次确认，且写入撤销栈
+    requestDeleteRows([rowId]);
+    return true;
   }
 
   function cancelEdit() {
@@ -1232,7 +1257,11 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     restoreScrollAcrossFrames(restoreScroll);
   }
 
-  function onEditKeydown(e: KeyboardEvent) {
+  function onEditKeydown(e: KeyboardEvent, compositionActive = false) {
+    // Enter/Escape can also be the key that commits an IME candidate. Never
+    // treat that key as the grid shortcut; otherwise a Chinese/Japanese input
+    // commits the cell before the composition is inserted (#12470).
+    if (isAiPromptImeCompositionEvent(e, compositionActive)) return;
     const isExpandedTextarea = typeof HTMLTextAreaElement !== "undefined" && e.target instanceof HTMLTextAreaElement && e.target.dataset.expandedCellEditor === "true";
     if (e.key === "Enter" && (!isExpandedTextarea || e.metaKey || e.ctrlKey)) {
       e.preventDefault();
@@ -1240,6 +1269,9 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     } else if (e.key === "Escape") {
       e.preventDefault();
       e.stopPropagation();
+      // 只取消本次输入，绝不在这里顺手删掉刚新增的空行：新增行在网格里是「批量粘贴的目标」
+      // （batchAppendPaste 要求选中的是空白新增行），把「离开编辑器」和「取消新增」合并
+      // 会让习惯了 Esc 收尾的用户莫名丢掉那行。取消新增由网格焦点下的第二次 Esc 承担（#11634）。
       cancelEdit();
     }
   }
@@ -1250,7 +1282,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     pushUndoSnapshot();
     rowStatusFilter.value = rowStatusFilterAfterAddingRow(rowStatusFilter.value);
     newRows.value.push(result.value.columns.map(() => null));
-    newRowMeta.value.push(allocateNewRowMeta(null));
+    newRowMeta.value.push({ ...allocateNewRowMeta(null), untouched: true });
     newRows.value = [...newRows.value];
     newRowMeta.value = [...newRowMeta.value];
     touchPendingChanges();
@@ -1296,7 +1328,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     if (count > batchSize) yield { completed: 0, total: count };
     for (let i = 0; i < count; i++) {
       preparedRows.push([...blankRow]);
-      preparedMeta.push(allocateNewRowMeta(placement));
+      preparedMeta.push({ ...allocateNewRowMeta(placement), untouched: true });
       if (count > batchSize && ((i + 1) % batchSize === 0 || i + 1 === count)) yield { completed: i + 1, total: count };
     }
     if (!isCurrent()) return undefined;
@@ -1429,6 +1461,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       }
       mappedRows.push(nextRow);
       mappedMeta.push(rowIndex < reusableNewRowCount && sourceMeta[targetNewIndex! + rowIndex] ? cloneNewRowMeta([sourceMeta[targetNewIndex! + rowIndex]!])[0]! : allocateNewRowMeta(targetPlacement));
+      delete mappedMeta[mappedMeta.length - 1]!.untouched;
       if (pastedRows.length > batchSize && ((rowIndex + 1) % batchSize === 0 || rowIndex + 1 === pastedRows.length)) yield { completed: rowIndex + 1, total: pastedRows.length };
     }
 
@@ -1594,7 +1627,11 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   }
 
   function requestDeleteRows(rowIds: number[]) {
-    if (!confirmDangerousRowDeletion.value) {
+    const onlyUntouchedRows = rowIds.every((rowId) => {
+      const item = getRowItem(rowId);
+      return item?.isNew && item.newIndex !== undefined && isUntouchedNewRow(item.data, item.newIndex);
+    });
+    if (!confirmDangerousRowDeletion.value || onlyUntouchedRows) {
       applyDeleteRows(rowIds);
       return;
     }
@@ -1647,13 +1684,20 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   }
 
   // --- Save/Discard ---
+  function isUntouchedNewRow(row: readonly CellValue[], newIndex: number): boolean {
+    return newRowMeta.value[newIndex]?.untouched === true && row.every((value) => value === null);
+  }
+
   function snapshotPendingSaveChanges(): PendingSaveSnapshot {
     const currentNewRows = [...newRows.value];
+    const includedIndexes = currentNewRows.flatMap((row, index) => (isUntouchedNewRow(row, index) ? [] : [index]));
     return {
       dirtyRows: new Map([...dirtyRows.value.entries()].map(([rowIndex, changes]) => [rowIndex, new Map(changes)])),
-      newRows: currentNewRows.map((row) => [...row]),
+      newRows: includedIndexes.map((index) => [...currentNewRows[index]!]),
+      // Also consume unused blanks after success, and lock them while saving
+      // so an edit cannot be lost when this snapshot is cleared.
       newRowRefs: currentNewRows,
-      newRowMeta: cloneNewRowMeta(newRowMeta.value),
+      newRowMeta: includedIndexes.flatMap((index) => (newRowMeta.value[index] ? cloneNewRowMeta([newRowMeta.value[index]!]) : [])),
       deletedRows: new Set(deletedRows.value),
     };
   }
@@ -1688,7 +1732,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     }
     dirtyRows.value = new Map(dirtyRows.value);
 
-    if (snapshot.newRows.length > 0) {
+    if (snapshot.newRowRefs.length > 0) {
       const savedNewRows = new Set(snapshot.newRowRefs);
       const keptRows: CellValue[][] = [];
       const keptMeta: GridNewRowMeta[] = [];
@@ -1793,6 +1837,9 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       const count = Number(matched);
       if (!Number.isFinite(count)) return KEYLESS_GUARD_UNVERIFIED_ERROR;
       if (count > guard.maxMatchedRows) return guard.message;
+      // A predicate built from a physical row locator must still address a row:
+      // zero means it moved under us, and the write would silently do nothing.
+      if (count < (guard.minMatchedRows ?? 0)) return guard.minMessage ?? guard.message;
     }
     return undefined;
   }
@@ -2035,6 +2082,11 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     }
     const snapshot = snapshotPendingSaveChanges();
     if (!hasPendingSaveChanges(snapshot)) {
+      if (snapshot.newRowRefs.length > 0) {
+        clearSavedPendingChanges(snapshot);
+        if (!hasPendingChanges.value) exitTransaction();
+        clearPendingChangeHistory();
+      }
       return;
     }
     const customHandler = customSaveHandler?.value;
@@ -2067,6 +2119,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     }
     saveError.value = "";
     saveWarning.value = "";
+    previewValidationMessage.value = "";
     isSaving.value = true;
     snapshot.newRowRefs.forEach((row) => savingNewRows.add(row));
     const shouldReloadAfterSave = snapshot.newRows.length > 0 || snapshot.deletedRows.size > 0;
@@ -2153,6 +2206,14 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       }
     }
     if (preparedSave?.validationError) {
+      if (saveOptions.autoSave) {
+        // Autosave can run while a new row is still being filled. Keep the
+        // draft staged until it becomes valid instead of surfacing a save
+        // failure for an expected intermediate state.
+        previewValidationMessage.value = preparedSave.validationError;
+        await finishInterruptedSaveChanges(snapshot);
+        return;
+      }
       saveError.value = preparedSave.validationError;
       await finishInterruptedSaveChanges(snapshot);
       return;
@@ -2405,7 +2466,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     const scroll = includeScroll ? (readScrollPosition() ?? pendingScrollRestore) : undefined;
     if (includeScroll) pendingScrollRestore = scroll;
     const quickEntryDraftRowSnapshot = draftRowHasValue() ? [...quickEntryDraftRow.value] : undefined;
-    if (!hasPendingChanges.value && !quickEntryDraftRowSnapshot && !(includeEditing && editingCell.value) && !scroll) {
+    if (!hasPendingChanges.value && newRows.value.length === 0 && !quickEntryDraftRowSnapshot && !(includeEditing && editingCell.value) && !scroll) {
       pendingChangesCache.delete(k);
       return;
     }
@@ -2481,19 +2542,21 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   async function previewChanges(): Promise<string[]> {
     isPreviewLoading.value = true;
     previewStatements.value = [];
+    previewValidationMessage.value = "";
     try {
+      const snapshot = snapshotPendingSaveChanges();
+      if (!hasPendingSaveChanges(snapshot)) return [];
       if (customSaveHandler?.value) {
         const preview = customSaveHandler.value.preview;
-        if (preview) return await preview({ dirtyRows: dirtyRows.value, newRows: newRows.value, newRowMeta: cloneNewRowMeta(newRowMeta.value), deletedRows: deletedRows.value, columns: result.value.columns, rows: result.value.rows });
+        if (preview) return await preview({ dirtyRows: snapshot.dirtyRows, newRows: snapshot.newRows, newRowMeta: snapshot.newRowMeta, deletedRows: snapshot.deletedRows, columns: result.value.columns, rows: result.value.rows });
         return [];
       }
-      const snapshot = snapshotPendingSaveChanges();
       if (options.prepareSaveBaseline) await options.prepareSaveBaseline(snapshot);
       const stmtOptions = saveStatementOptions(snapshot);
       if (!stmtOptions) return [];
       const prepared = await prepareSaveStatements(stmtOptions);
       if (prepared?.validationError) {
-        saveError.value = prepared.validationError;
+        previewValidationMessage.value = prepared.validationError;
         return [];
       }
       const stmts = prepared?.statements ?? [];
@@ -2529,6 +2592,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     isSaving,
     saveError,
     saveWarning,
+    previewValidationMessage,
     isConditionalUpdateActive,
     conditionalUpdateExecution,
     useTransaction,
@@ -2542,6 +2606,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     commitEditFromBlur,
     applyCellValue,
     restoreCellValue,
+    cancelUntouchedPendingRow,
     cancelEdit,
     onEditKeydown,
     addRow,
@@ -2586,6 +2651,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     previewStatements,
     isPreviewLoading,
     previewChanges,
+    isUntouchedNewRow,
     savePendingSnapshot,
     // Exposed for tests: the window listener is only registered inside a component
     // instance, so specs drive the tab-switch path directly.

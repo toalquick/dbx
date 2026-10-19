@@ -1,9 +1,11 @@
-export type CsvQuoteMode = "all" | "necessary" | "never";
+/** `strings`（mod 42）是类型感知模式：字符串值与表头一律加引号，数值/布尔裸写；
+ *  类型分流在 formatCsv 的调用侧完成——进入 escapeCsvField 的都是文本值。 */
+export type CsvQuoteMode = "all" | "necessary" | "never" | "strings";
 
 export const DEFAULT_CSV_QUOTE_MODE: CsvQuoteMode = "all";
 
 export function normalizeCsvQuoteMode(value: unknown): CsvQuoteMode {
-  return value === "necessary" || value === "never" ? value : DEFAULT_CSV_QUOTE_MODE;
+  return value === "necessary" || value === "never" || value === "strings" ? value : DEFAULT_CSV_QUOTE_MODE;
 }
 
 /** 导出对话框一次选定的 CSV 文本格式（分隔符/引号字符/引号模式/表头开关）。 */
@@ -25,6 +27,8 @@ export function csvFieldNeedsQuotes(value: string, delimiter = DEFAULT_CSV_DELIM
 
 export function escapeCsvField(value: string, quoteMode: CsvQuoteMode, delimiter = DEFAULT_CSV_DELIMITER, quoteChar = DEFAULT_CSV_QUOTE_CHAR): string {
   if (quoteMode === "never") return value;
+  // strings 与 all 同路径：本函数只接收文本值（表头/字符串单元格），数值/布尔的
+  // 裸写分流在 formatCsv 里做，与 Rust push_csv_value_formatted 的类型分发对齐。
   if (quoteMode === "necessary" && !csvFieldNeedsQuotes(value, delimiter, quoteChar)) return value;
   return `${quoteChar}${value.split(quoteChar).join(quoteChar + quoteChar)}${quoteChar}`;
 }

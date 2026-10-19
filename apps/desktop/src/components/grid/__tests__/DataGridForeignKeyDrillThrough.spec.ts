@@ -25,10 +25,27 @@ describe("DataGrid foreign-key drill-through (same pane, both render modes)", ()
   });
 
   it("routes the jump in place: data tab reuses its tab, query tab executes in its results pane", () => {
-    expect(dataGridSource).toContain("openTableTarget(navigationTarget, { reuseTabId: props.foreignKeyNavigationTabId })");
-    expect(dataGridSource).toContain("executeTableTargetInQueryTab(navigationTarget, { tabId: props.foreignKeyNavigationTabId })");
+    expect(dataGridSource).toContain("openTableTarget(navigationTarget, { reuseTabId: props.foreignKeyNavigationTabId, drillBack: true })");
+    expect(dataGridSource).toContain("executeTableTargetInQueryTab(navigationTarget, { tabId: props.foreignKeyNavigationTabId, drillBack: true })");
     // legacy fallback when no owning tab is provided (e.g. embedded grids)
     expect(dataGridSource).toContain("await openTableTarget(navigationTarget);");
+  });
+
+  it("records a restore point before rewriting the pane and offers a back control (mod 43)", () => {
+    // navigation entries push the drill-back stack only on the in-place drill paths
+    expect(navigationTargetsSource).toContain("if (options.drillBack && canReuse && reuseTab) {");
+    expect(navigationTargetsSource).toContain("pushForeignKeyDrillBack(reuseTab.id, {");
+    expect(navigationTargetsSource).toContain('pushForeignKeyDrillBack(options.tabId, { restore: { kind: "queryResult", sql: previousDisplayedSql }, arrivedSql: sql, label: target.tableName });');
+    // the grid pops the stack through the same executors (no new-tab fallback on back)
+    expect(dataGridSource).toContain("await openTableTarget(popped.restore.target, { reuseTabId: tabId });");
+    expect(dataGridSource).toContain("await executeSqlInQueryTabResults(tabId, popped.restore.sql);");
+    expect(dataGridSource).toContain('data-toolbar-action="foreignKeyDrillBack"');
+    expect(dataGridSource).toContain("peekForeignKeyDrillBack(tabId, (entry) => foreignKeyDrillBackEntryMatchesTab(entry, tab))");
+    // 跳转/返回的过渡期保护：发起返回后把剩余栈顶标记为等待落地，链式返回才走得通
+    expect(dataGridSource).toContain("markForeignKeyDrillBackPendingArrival(tabId);");
+    // Alt+← 网格内返回：仅在持有可返回条目时消费，不拦截其它 Alt+← 行为
+    expect(dataGridSource).toContain('event.key === "ArrowLeft" && foreignKeyDrillBackTarget.value');
+    expect(dataGridSource).toContain("await goForeignKeyDrillBack();");
   });
 
   it("resolves foreign keys per source table for multi-source (JOIN) results", () => {

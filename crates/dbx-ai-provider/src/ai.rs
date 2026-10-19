@@ -101,7 +101,7 @@ pub enum AiProvider {
     ClaudeCodeCli,
     #[serde(rename = "pi-agent-cli")]
     PiAgentCli,
-    #[serde(rename = "opencode-cli")]
+    #[serde(rename = "opencode-cli", alias = "opencode2-cli")]
     OpenCodeCli,
     #[serde(rename = "cursor-cli")]
     CursorCli,
@@ -461,6 +461,8 @@ pub struct AiConfig {
     pub opencode_cli_path: Option<String>,
     #[serde(default)]
     pub opencode_cli_env: HashMap<String, String>,
+    #[serde(default)]
+    pub opencode_cli_version: Option<String>,
     #[serde(default)]
     pub cursor_cli_path: Option<String>,
     #[serde(default)]
@@ -1891,6 +1893,17 @@ pub fn maybe_bearer_headers(config: &AiConfig) -> Result<HeaderMap, String> {
     if !api_key.is_empty() {
         headers.insert(AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| e.to_string())?);
     }
+    if matches!(config.provider, AiProvider::GithubCopilot) {
+        // Copilot's gateway routes on these editor headers (the same shape the
+        // device-flow exchange sends); user-supplied custom headers below can
+        // still override them.
+        headers.insert("editor-version", HeaderValue::from_static(crate::copilot_auth::COPILOT_EDITOR_VERSION));
+        headers.insert(
+            "editor-plugin-version",
+            HeaderValue::from_static(crate::copilot_auth::COPILOT_EDITOR_PLUGIN_VERSION),
+        );
+        headers.insert("user-agent", HeaderValue::from_static(crate::copilot_auth::COPILOT_USER_AGENT));
+    }
     append_custom_headers(&mut headers, config)?;
     Ok(headers)
 }
@@ -1972,6 +1985,7 @@ fn ai_endpoint_is_loopback(config: &AiConfig) -> bool {
     let Some(host) = url.host_str() else {
         return false;
     };
+    let host = host.strip_prefix('[').and_then(|host| host.strip_suffix(']')).unwrap_or(host);
     host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().map(|addr| addr.is_loopback()).unwrap_or(false)
 }
 
@@ -1980,7 +1994,10 @@ pub fn build_ai_http_client(config: &AiConfig, timeout_secs: u64) -> Result<reqw
     if config.skip_tls_verify {
         builder = builder.danger_accept_invalid_certs(true);
     }
-    if config.proxy_enabled && !config.proxy_url.trim().is_empty() && !ai_endpoint_is_loopback(config) {
+    if ai_endpoint_is_loopback(config) {
+        // Skipping an explicit proxy alone still allows environment and system proxies.
+        builder = builder.no_proxy();
+    } else if config.proxy_enabled && !config.proxy_url.trim().is_empty() {
         let proxy_url = normalize_ai_proxy_url(&config.proxy_url);
         let proxy = reqwest::Proxy::all(&proxy_url).map_err(|e| format!("Invalid AI proxy URL: {e}"))?;
         builder = builder.proxy(proxy);
@@ -2299,6 +2316,15 @@ async fn retain_ollama_completion_models(
 }
 
 pub async fn list_models_core(config: &AiConfig) -> Result<Vec<AiModelInfo>, String> {
+    let mut intercepted;
+    let config = if matches!(config.provider, AiProvider::GithubCopilot) {
+        // Copilot model listing needs the session token too (see `complete`).
+        intercepted = config.clone();
+        crate::copilot_auth::apply_copilot_auth(&mut intercepted).await?;
+        &intercepted
+    } else {
+        config
+    };
     let mut models = match config.provider {
         AiProvider::CodexCli => crate::ai_codex_cli::list_codex_models(config).await?,
         AiProvider::ClaudeCodeCli => crate::ai_claude_code_cli::list_claude_code_models(config).await?,
@@ -3248,6 +3274,9 @@ pub async fn test_connection_core(config: &AiConfig) -> Result<AiTestConnectionR
     }
 
     let mut resolved_config = config.clone();
+    // Copilot first: model resolution below fires network calls, which must
+    // not go out with the raw stored OAuth token.
+    crate::copilot_auth::apply_copilot_auth(&mut resolved_config).await?;
     resolve_test_connection_model(&mut resolved_config).await?;
     let config = &resolved_config;
     validate_config(config)?;
@@ -3727,6 +3756,18 @@ where
 }
 
 pub async fn complete(request: &AiCompletionRequest) -> Result<String, String> {
+    let mut intercepted;
+    let request = if matches!(request.config.provider, AiProvider::GithubCopilot) {
+        // Copilot's stored key is a device-flow OAuth token; swap it (and the
+        // endpoint) for a fresh session token before anything else. The retry
+        // closure below re-clones the original `request`, so the swap must
+        // shadow the parameter itself, not just a local config copy.
+        intercepted = request.clone();
+        crate::copilot_auth::apply_copilot_auth(&mut intercepted.config).await?;
+        &intercepted
+    } else {
+        request
+    };
     validate_config(&request.config)?;
 
     if is_cli_provider(&request.config.provider) {
@@ -3795,6 +3836,16 @@ pub async fn stream(
     cancelled: &Notify,
     on_chunk: impl Fn(AiStreamChunk),
 ) -> Result<(), String> {
+    let mut intercepted;
+    let request = if matches!(request.config.provider, AiProvider::GithubCopilot) {
+        // See `complete` for why this shadows the parameter: the swapped
+        // session token must reach every downstream use of `request`.
+        intercepted = request.clone();
+        crate::copilot_auth::apply_copilot_auth(&mut intercepted.config).await?;
+        &intercepted
+    } else {
+        request
+    };
     validate_config(&request.config)?;
 
     if is_cli_provider(&request.config.provider) {
@@ -5220,6 +5271,16 @@ pub async fn stream_with_tools(
     cancelled: &Notify,
     on_chunk: impl Fn(AiStreamChunk),
 ) -> Result<(Vec<crate::agent_events::ToolCall>, Option<TokenUsage>), String> {
+    let mut intercepted;
+    let (config, request) = if matches!(config.provider, AiProvider::GithubCopilot) {
+        // See `complete` for the shadowing rationale; callers keep `config`
+        // and `request.config` identical, so one owned clone covers both.
+        intercepted = request.clone();
+        crate::copilot_auth::apply_copilot_auth(&mut intercepted.config).await?;
+        (&intercepted.config, &intercepted)
+    } else {
+        (config, request)
+    };
     validate_config(config)?;
     if is_cli_provider(&config.provider) {
         return Err("CLI providers are only supported through the DBX AI agent loop".to_string());
@@ -5667,6 +5728,7 @@ mod tests {
                 pi_agent_cli_env: Default::default(),
                 opencode_cli_path: None,
                 opencode_cli_env: Default::default(),
+                opencode_cli_version: None,
                 cursor_cli_path: None,
                 cursor_cli_env: Default::default(),
                 grok_cli_path: None,
@@ -6304,6 +6366,7 @@ mod tests {
         assert!(config.pi_agent_cli_env.is_empty());
         assert!(config.opencode_cli_path.is_none());
         assert!(config.opencode_cli_env.is_empty());
+        assert!(config.opencode_cli_version.is_none());
         assert!(config.cursor_cli_path.is_none());
         assert!(config.cursor_cli_env.is_empty());
         assert!(config.codebuddy_cli_path.is_none());
@@ -6340,6 +6403,7 @@ mod tests {
             pi_agent_cli_env: Default::default(),
             opencode_cli_path: None,
             opencode_cli_env: Default::default(),
+            opencode_cli_version: None,
             cursor_cli_path: None,
             cursor_cli_env: Default::default(),
             grok_cli_path: None,
@@ -6383,6 +6447,7 @@ mod tests {
             pi_agent_cli_env: Default::default(),
             opencode_cli_path: None,
             opencode_cli_env: Default::default(),
+            opencode_cli_version: None,
             cursor_cli_path: None,
             cursor_cli_env: Default::default(),
             grok_cli_path: None,
@@ -6414,6 +6479,29 @@ mod tests {
     }
 
     #[test]
+    fn ai_http_client_identifies_loopback_endpoints() {
+        for (endpoint, expected) in [
+            ("http://localhost:3456/v1", true),
+            ("http://LOCALHOST:3456/v1", true),
+            ("http://127.0.0.1:3456/v1", true),
+            ("http://127.12.34.56:3456/v1", true),
+            ("http://[::1]:3456/v1", true),
+            ("http://192.168.1.2:3456/v1", false),
+            ("http://10.0.0.1:3456/v1", false),
+            ("http://[fd00::1]:3456/v1", false),
+            ("https://api.example.com/v1", false),
+            ("http://localhost.example.com/v1", false),
+            ("invalid endpoint", false),
+        ] {
+            let config: AiConfig = serde_json::from_value(serde_json::json!({
+                "provider": "openai-compatible", "endpoint": endpoint
+            }))
+            .unwrap();
+            assert_eq!(super::ai_endpoint_is_loopback(&config), expected, "{endpoint}");
+        }
+    }
+
+    #[test]
     fn ai_http_client_bypasses_proxy_for_loopback_endpoint() {
         let config = AiConfig {
             provider: AiProvider::OpenaiCompatible,
@@ -6441,6 +6529,7 @@ mod tests {
             pi_agent_cli_env: Default::default(),
             opencode_cli_path: None,
             opencode_cli_env: Default::default(),
+            opencode_cli_version: None,
             cursor_cli_path: None,
             cursor_cli_env: Default::default(),
             grok_cli_path: None,
@@ -6482,6 +6571,7 @@ mod tests {
             pi_agent_cli_env: Default::default(),
             opencode_cli_path: None,
             opencode_cli_env: Default::default(),
+            opencode_cli_version: None,
             cursor_cli_path: None,
             cursor_cli_env: Default::default(),
             grok_cli_path: None,
@@ -6527,6 +6617,7 @@ mod tests {
             pi_agent_cli_env: Default::default(),
             opencode_cli_path: None,
             opencode_cli_env: Default::default(),
+            opencode_cli_version: None,
             cursor_cli_path: None,
             cursor_cli_env: Default::default(),
             grok_cli_path: None,
@@ -6569,6 +6660,7 @@ mod tests {
             pi_agent_cli_env: Default::default(),
             opencode_cli_path: None,
             opencode_cli_env: Default::default(),
+            opencode_cli_version: None,
             cursor_cli_path: None,
             cursor_cli_env: Default::default(),
             grok_cli_path: None,
@@ -6630,6 +6722,7 @@ mod tests {
             pi_agent_cli_env: Default::default(),
             opencode_cli_path: None,
             opencode_cli_env: Default::default(),
+            opencode_cli_version: None,
             cursor_cli_path: None,
             cursor_cli_env: Default::default(),
             grok_cli_path: None,
@@ -6667,6 +6760,7 @@ mod tests {
             pi_agent_cli_env: Default::default(),
             opencode_cli_path: None,
             opencode_cli_env: Default::default(),
+            opencode_cli_version: None,
             cursor_cli_path: None,
             cursor_cli_env: Default::default(),
             grok_cli_path: None,
@@ -6707,6 +6801,7 @@ mod tests {
             pi_agent_cli_env: Default::default(),
             opencode_cli_path: None,
             opencode_cli_env: Default::default(),
+            opencode_cli_version: None,
             cursor_cli_path: None,
             cursor_cli_env: Default::default(),
             grok_cli_path: None,
@@ -6814,6 +6909,7 @@ mod tests {
             pi_agent_cli_env: Default::default(),
             opencode_cli_path: None,
             opencode_cli_env: Default::default(),
+            opencode_cli_version: None,
             cursor_cli_path: None,
             cursor_cli_env: Default::default(),
             grok_cli_path: None,
@@ -6912,6 +7008,52 @@ mod tests {
     }
 
     #[test]
+    fn copilot_bearer_headers_carry_editor_identity() {
+        let config = AiConfig {
+            max_output_tokens: None,
+            provider: AiProvider::GithubCopilot,
+            api_key: "sess-token".to_string(),
+            auth_method: AiAuthMethod::Bearer,
+            endpoint: "https://api.githubcopilot.com".to_string(),
+            model: "gpt-4.1".to_string(),
+            ..test_config(AiProvider::GithubCopilot)
+        };
+        let headers = maybe_bearer_headers(&config).unwrap();
+        // Copilot's gateway routes on the editor headers; the Bearer session
+        // token (swapped in by apply_copilot_auth at request time) stays intact.
+        assert_eq!(headers.get("editor-version").unwrap(), "vscode/1.85.1");
+        assert_eq!(headers.get("editor-plugin-version").unwrap(), "copilot/1.155.0");
+        assert_eq!(headers.get("user-agent").unwrap(), "GithubCopilot/1.155.0");
+        assert_eq!(headers.get(AUTHORIZATION).unwrap(), "Bearer sess-token");
+        let other = AiConfig { provider: AiProvider::Openai, ..config };
+        assert!(maybe_bearer_headers(&other).unwrap().get("editor-version").is_none());
+    }
+
+    #[tokio::test]
+    async fn copilot_pat_keys_are_rejected_before_any_request() {
+        let request = AiCompletionRequest {
+            config: AiConfig {
+                max_output_tokens: None,
+                provider: AiProvider::GithubCopilot,
+                api_key: "ghp_rejected".to_string(),
+                auth_method: AiAuthMethod::Bearer,
+                endpoint: "https://api.githubcopilot.com".to_string(),
+                model: "gpt-4.1".to_string(),
+                ..test_config(AiProvider::GithubCopilot)
+            },
+            system_prompt: String::new(),
+            messages: Vec::new(),
+            task_contract: None,
+            max_tokens: None,
+            prompt_cache_key: None,
+        };
+        // If the request-time interception missed, this would hit the real
+        // endpoint with the PAT; instead the sign-in guidance comes back first.
+        let error = complete(&request).await.unwrap_err();
+        assert!(error.contains("rejects personal access tokens"), "{error}");
+    }
+
+    #[test]
     fn auto_adds_v1_to_openai_compatible_endpoints() {
         // Endpoint without /v1 — auto add
         let config = AiConfig {
@@ -6940,6 +7082,7 @@ mod tests {
             pi_agent_cli_env: Default::default(),
             opencode_cli_path: None,
             opencode_cli_env: Default::default(),
+            opencode_cli_version: None,
             cursor_cli_path: None,
             cursor_cli_env: Default::default(),
             grok_cli_path: None,
@@ -7055,6 +7198,7 @@ mod tests {
             pi_agent_cli_env: Default::default(),
             opencode_cli_path: None,
             opencode_cli_env: Default::default(),
+            opencode_cli_version: None,
             cursor_cli_path: None,
             cursor_cli_env: Default::default(),
             grok_cli_path: None,
@@ -7105,6 +7249,7 @@ mod tests {
             pi_agent_cli_env: Default::default(),
             opencode_cli_path: None,
             opencode_cli_env: Default::default(),
+            opencode_cli_version: None,
             cursor_cli_path: None,
             cursor_cli_env: Default::default(),
             grok_cli_path: None,
@@ -7277,6 +7422,7 @@ mod tests {
             pi_agent_cli_env: Default::default(),
             opencode_cli_path: None,
             opencode_cli_env: Default::default(),
+            opencode_cli_version: None,
             cursor_cli_path: None,
             cursor_cli_env: Default::default(),
             grok_cli_path: None,
@@ -7323,6 +7469,7 @@ mod tests {
             pi_agent_cli_env: Default::default(),
             opencode_cli_path: None,
             opencode_cli_env: Default::default(),
+            opencode_cli_version: None,
             cursor_cli_path: None,
             cursor_cli_env: Default::default(),
             grok_cli_path: None,
@@ -7417,6 +7564,7 @@ mod tests {
             pi_agent_cli_env: Default::default(),
             opencode_cli_path: None,
             opencode_cli_env: Default::default(),
+            opencode_cli_version: None,
             cursor_cli_path: None,
             cursor_cli_env: Default::default(),
             grok_cli_path: None,
@@ -7766,6 +7914,7 @@ mod tests {
             pi_agent_cli_env: Default::default(),
             opencode_cli_path: None,
             opencode_cli_env: Default::default(),
+            opencode_cli_version: None,
             cursor_cli_path: None,
             cursor_cli_env: Default::default(),
             grok_cli_path: None,
@@ -7999,6 +8148,7 @@ mod tests {
             pi_agent_cli_env: Default::default(),
             opencode_cli_path: None,
             opencode_cli_env: Default::default(),
+            opencode_cli_version: None,
             cursor_cli_path: None,
             cursor_cli_env: Default::default(),
             grok_cli_path: None,
@@ -8052,6 +8202,7 @@ mod tests {
             pi_agent_cli_env: Default::default(),
             opencode_cli_path: None,
             opencode_cli_env: Default::default(),
+            opencode_cli_version: None,
             cursor_cli_path: None,
             cursor_cli_env: Default::default(),
             grok_cli_path: None,
@@ -8108,6 +8259,7 @@ mod tests {
             pi_agent_cli_env: Default::default(),
             opencode_cli_path: None,
             opencode_cli_env: Default::default(),
+            opencode_cli_version: None,
             cursor_cli_path: None,
             cursor_cli_env: Default::default(),
             grok_cli_path: None,
@@ -8158,6 +8310,7 @@ mod tests {
             pi_agent_cli_env: Default::default(),
             opencode_cli_path: None,
             opencode_cli_env: Default::default(),
+            opencode_cli_version: None,
             cursor_cli_path: None,
             cursor_cli_env: Default::default(),
             grok_cli_path: None,
@@ -8552,6 +8705,7 @@ mod tests {
             pi_agent_cli_env: Default::default(),
             opencode_cli_path: None,
             opencode_cli_env: Default::default(),
+            opencode_cli_version: None,
             cursor_cli_path: None,
             cursor_cli_env: Default::default(),
             grok_cli_path: None,
@@ -8629,6 +8783,7 @@ mod tests {
             pi_agent_cli_env: Default::default(),
             opencode_cli_path: None,
             opencode_cli_env: Default::default(),
+            opencode_cli_version: None,
             cursor_cli_path: None,
             cursor_cli_env: Default::default(),
             grok_cli_path: None,
@@ -8702,6 +8857,7 @@ mod tests {
             pi_agent_cli_env: Default::default(),
             opencode_cli_path: None,
             opencode_cli_env: Default::default(),
+            opencode_cli_version: None,
             cursor_cli_path: None,
             cursor_cli_env: Default::default(),
             grok_cli_path: None,

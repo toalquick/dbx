@@ -30,6 +30,7 @@ pub enum DataGridExtractorId {
     OneRow,
     SqlInList,
     SqlInserts,
+    SqlDeletesInserts,
     SqlUpdates,
     SqlSelect,
     WhereClause,
@@ -57,6 +58,9 @@ pub enum DataGridQuotePolicy {
     #[default]
     Minimal,
     Never,
+    /// 类型感知引号（mod 42）：字符串（及 JSON 化的对象/数组）一律加引号，
+    /// 数值/布尔裸写——与 CSV 导出的 strings 引号模式同一语义。
+    Strings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -9,6 +9,7 @@ pub mod config_cmd;
 pub mod connection;
 #[allow(dead_code, unused_imports)]
 mod connection_secrets;
+pub mod copilot_oauth;
 pub mod csv_export;
 pub mod dameng_dump;
 pub mod data_compare;

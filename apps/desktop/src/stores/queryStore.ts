@@ -90,6 +90,7 @@ import { isDataTabMetadataLifecycleStale } from "@/lib/sidebar/dataTabOpenPolicy
 import type { SqlInsertMode } from "@/lib/export/sqlInsertMode";
 import { csvNullLiteralForMode } from "@/lib/export/csvNullMode";
 import { tableOpenPageLimit } from "@/lib/table/tableOpenPageLimit";
+import { formatMetadataColumnTypeLabel } from "@/lib/dataGrid/dataGridColumnType";
 import { getCachedTableMetadata, loadTableColumns, loadTableIndexes, loadTableMetadata, tableMetadataToDataTabMeta, updateCachedTableMetadataType, type TableMetadataRequest } from "@/lib/metadata/tableMetadataCache";
 import { loadObjectDdl } from "@/lib/metadata/objectDdlCache";
 import { MetadataTaskLimiter } from "@/lib/metadata/metadataTaskLimiter";
@@ -99,7 +100,8 @@ import { connectionObjectTreeNodeSchema, connectionQueryExecutionSchema, connect
 import { frontendQueryTimeoutDelayMs, frontendQueryTimeoutSecsForSql, queryTimeoutSecsForConnection } from "@/lib/sql/queryTimeout";
 import { queryResultNameFromPreamble, queryResultSourceLabel, queryResultSourceNameParts } from "@/lib/sql/queryResultSource";
 import { sqlServerCountUsesLocalTempTable } from "@/lib/query/queryResultCountSession";
-import { stripPaginationRowNumber } from "@/lib/query/queryPaginationResult";
+import { stripPaginationRowNumber, trimQueryPageProbe } from "@/lib/query/queryPaginationResult";
+import { mysqlTablePageBaseSql } from "@/lib/table/tableDataPageProbe";
 import { beginDataGridNativeSelectionBlock, finishDataGridNativeSelectionBlock } from "@/lib/dataGrid/dataGridNativeSelection";
 import { appendLargeValueCells, canUseTableDataLargeValuePreview, remapLargeValueCells, supportsTableDataLargeValuePreview, tableDataLargeValuePreviewOptions, TABLE_DATA_RESULT_MAX_BYTES } from "@/lib/dataGrid/dataGridLargeValues";
 import { simpleDataGridOrderByReferencesMissingColumn, sortDataGridRowIndexes, type DataGridSortDirection } from "@/lib/dataGrid/dataGridSort";
@@ -125,6 +127,8 @@ import { decodeQueryResultArchive, encodeQueryResultArchive, type DecodedQueryRe
 import * as api from "@/lib/backend/api";
 import { createFrontendPluginRegistry } from "@/lib/plugins/frontendPlugin";
 import { snapshotPluginWorkbenchContext } from "@/lib/plugins/pluginData";
+import { usePluginBottomDock } from "@/lib/plugins/pluginBottomDock";
+import { anySurfaceReferencesPluginConnection, pluginWorkbenchTitlesForConnection } from "@/lib/plugins/pluginConnectionSurfaces";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
@@ -194,7 +198,8 @@ export interface EditorWorkspacePersistState {
   sizes: number[];
 }
 
-export type QueryMetadataPatch = Pick<QueryTab, "queryAnalysis" | "querySourceColumns" | "queryWriteTargets" | "queryEditabilityReason" | "tableMeta" | "resultColumnComments" | "queryDisplaySourceColumns">;
+export type QueryMetadataPatch = Pick<QueryTab, "queryAnalysis" | "querySourceColumns" | "queryWriteTargets" | "queryEditabilityReason" | "tableMeta" | "resultColumnComments" | "resultColumnTypeLabels" | "queryDisplaySourceColumns">;
+type QueryDisplayMetadataReady = Pick<QueryMetadataPatch, "resultColumnComments" | "resultColumnTypeLabels" | "queryDisplaySourceColumns">;
 
 interface BatchSqlResumeOptions {
   batch: BatchSqlExecution;
@@ -382,7 +387,8 @@ function markQueryResultsRowsRaw(results: QueryResult[]): QueryResult[] {
 }
 
 function exactTotalFromIncompletePage(result: QueryResult, pageLimit: number | undefined, pageOffset: number | undefined, useAgentResultSession: boolean | undefined): number | undefined {
-  if (typeof pageLimit !== "number" || result.rows.length >= pageLimit || result.truncated === true) return undefined;
+  if (typeof pageLimit !== "number" || result.truncated === true || result.page_has_more === true) return undefined;
+  if (result.rows.length >= pageLimit && result.page_has_more !== false) return undefined;
   // Cursor-backed drivers must explicitly confirm exhaustion; an omitted
   // has_more value may come from an older driver or an exhausted row cap.
   if (useAgentResultSession && result.has_more !== false) return undefined;
@@ -445,6 +451,7 @@ export function appendQueryResultSegment(previous: QueryResult, segment: QueryRe
     client_result_ms: previous.client_result_ms !== undefined && segment.client_result_ms !== undefined ? previous.client_result_ms + segment.client_result_ms : undefined,
     timing_page_count: (previous.timing_page_count ?? 1) + (segment.timing_page_count ?? 1),
     has_more: previous.rows.length + appendedRowCount >= maxRows ? false : segment.has_more,
+    page_has_more: appendedRowCount < segment.rows.length ? true : segment.page_has_more,
   });
 }
 
@@ -1178,7 +1185,7 @@ export const useQueryStore = defineStore("query", () => {
   // 里而不是渲染函数里，是为了避免在 computed 求值过程中写标签状态；getter 只读
   // 参与标题计算的字段（id + 显示标题），分配编号本身不会再次触发它。
   watch(
-    () => tabs.value.map((tab) => `${tab.id}\u0000${tabDisplayTitle(tab, t)}\u0000${tab.titleSuffix ?? ""}`),
+    () => tabs.value.map((tab) => `${tab.id}\u0000${tab.mode || "query"}\u0000${tabDisplayTitle(tab, t)}\u0000${tab.titleSuffix ?? ""}`),
     () => syncTabTitleNumbers(tabs.value, t),
     { immediate: true, flush: "sync" },
   );
@@ -1887,6 +1894,7 @@ export const useQueryStore = defineStore("query", () => {
     tab.querySourceColumns = undefined;
     tab.queryWriteTargets = undefined;
     tab.resultColumnComments = undefined;
+    tab.resultColumnTypeLabels = undefined;
     tab.queryDisplaySourceColumns = undefined;
     tab.queryEditabilityReason = undefined;
     tab.mongoEditTarget = undefined;
@@ -1969,6 +1977,7 @@ export const useQueryStore = defineStore("query", () => {
     run.querySourceColumns = undefined;
     run.queryWriteTargets = undefined;
     run.resultColumnComments = undefined;
+    run.resultColumnTypeLabels = undefined;
     run.queryDisplaySourceColumns = undefined;
     run.queryEditabilityReason = undefined;
     run.mongoEditTarget = undefined;
@@ -2019,6 +2028,7 @@ export const useQueryStore = defineStore("query", () => {
     tab.querySourceColumns = run.querySourceColumns;
     tab.queryWriteTargets = run.queryWriteTargets;
     tab.resultColumnComments = run.resultColumnComments;
+    tab.resultColumnTypeLabels = run.resultColumnTypeLabels;
     tab.queryDisplaySourceColumns = run.queryDisplaySourceColumns;
     tab.queryEditabilityReason = run.queryEditabilityReason;
     tab.mongoEditTarget = run.mongoEditTarget;
@@ -2317,6 +2327,7 @@ export const useQueryStore = defineStore("query", () => {
         querySourceColumns: run.querySourceColumns,
         queryWriteTargets: run.queryWriteTargets,
         resultColumnComments: run.resultColumnComments,
+        resultColumnTypeLabels: run.resultColumnTypeLabels,
         queryDisplaySourceColumns: run.queryDisplaySourceColumns,
         queryEditabilityReason: run.queryEditabilityReason,
         tableMeta: run.tableMeta,
@@ -2410,6 +2421,7 @@ export const useQueryStore = defineStore("query", () => {
       querySourceColumns: tab.querySourceColumns,
       queryWriteTargets: tab.queryWriteTargets,
       resultColumnComments: tab.resultColumnComments,
+      resultColumnTypeLabels: tab.resultColumnTypeLabels,
       queryDisplaySourceColumns: tab.queryDisplaySourceColumns,
       queryEditabilityReason: tab.queryEditabilityReason,
       mongoEditTarget: tab.mongoEditTarget,
@@ -2520,6 +2532,7 @@ export const useQueryStore = defineStore("query", () => {
       querySourceColumns: tab.querySourceColumns,
       queryWriteTargets: tab.queryWriteTargets,
       resultColumnComments: tab.resultColumnComments,
+      resultColumnTypeLabels: tab.resultColumnTypeLabels,
       queryDisplaySourceColumns: tab.queryDisplaySourceColumns,
       queryEditabilityReason: tab.queryEditabilityReason,
       mongoEditTarget: tab.mongoEditTarget,
@@ -4115,10 +4128,11 @@ export const useQueryStore = defineStore("query", () => {
         return suffix ? Math.max(highest, Number(suffix[1])) : highest;
       }, 0) + 1;
     const baseTitle = options.title || contributionId;
+    const title = siblingTabs.length >= 1 ? `${baseTitle} (${nextSessionNumber})` : baseTitle;
     const id = uuid();
     const tab: QueryTab = {
       id,
-      title: siblingTabs.length >= 1 ? `${baseTitle} (${nextSessionNumber})` : baseTitle,
+      title,
       connectionId,
       database: options.database || "",
       sql: "",
@@ -4130,6 +4144,7 @@ export const useQueryStore = defineStore("query", () => {
         commandId: options.commandId,
         pluginId,
         contributionId,
+        defaultTitle: title,
         context: options.context ? snapshotPluginWorkbenchContext(options.context) : undefined,
       },
     };
@@ -4158,7 +4173,30 @@ export const useQueryStore = defineStore("query", () => {
       if (!localizedTitle) continue;
       const suffix = / \((\d+)\)$/.exec(tab.title)?.[0] || "";
       tab.title = `${localizedTitle}${suffix}`;
+      if (tab.pluginWorkbench) {
+        tab.pluginWorkbench.defaultTitle = tab.title;
+      }
     }
+  }
+
+  function setPluginWorkbenchTabTitle(id: string, title: string | null): boolean {
+    const tab = tabs.value.find((t) => t.id === id);
+    if (!tab || tab.mode !== "plugin-workbench" || !tab.pluginWorkbench) return false;
+    const trimmed = typeof title === "string" ? title.trim().slice(0, 256) : "";
+    if (trimmed) {
+      tab.title = trimmed;
+      tab.customTitle = true;
+    } else {
+      tab.title = tab.pluginWorkbench.defaultTitle || tab.pluginWorkbench.contributionId;
+      tab.customTitle = false;
+    }
+    return true;
+  }
+
+  function getPluginWorkbenchTabTitle(id: string): string | undefined {
+    const tab = tabs.value.find((t) => t.id === id);
+    if (!tab || tab.mode !== "plugin-workbench") return undefined;
+    return tab.title;
   }
 
   function openPluginFilesystem(pluginId: string, providerId: string, options: { title?: string; connectionId?: string; rootUri?: string; currentUri?: string; forceNew?: boolean } = {}) {
@@ -4692,6 +4730,16 @@ export const useQueryStore = defineStore("query", () => {
    * Fire-and-forget; concurrent releases for the same connection coalesce, and
    * a reopen racing the release wins.
    */
+  /**
+   * #193b — display titles of plugin surfaces bound to the connection, exposed
+   * to plugins via host.listConnections(workbenchTitles). Dock terminal
+   * entries come first (the user-renamable terminals a batch-send panel should
+   * follow), then workbench tabs.
+   */
+  function pluginWorkbenchTitles(connectionId: string): string[] {
+    return pluginWorkbenchTitlesForConnection(tabs.value, usePluginBottomDock().entries.value, connectionId);
+  }
+
   function releasePluginConnectionsAfterClose(closedTabs: ReadonlyArray<QueryTab>) {
     const closedPluginTabsByConnection = new Map<string, Set<string>>();
     for (const tab of closedTabs) {
@@ -4712,7 +4760,12 @@ export const useQueryStore = defineStore("query", () => {
           // Yield one microtask so a same-tick reopen registers its
           // replacement plugin tab before we tear the connection down.
           await Promise.resolve();
-          if (tabs.value.some((tab) => (tab.mode === "plugin-workbench" || tab.mode === "plugin-filesystem") && pluginTabConnectionId(tab) === connectionId)) return;
+          // #193: dock terminal entries live outside `tabs` — closing the last
+          // tab while a dock terminal still holds the connection must not tear
+          // it down under the surviving terminals. Floating windows (surface
+          // "window", reserved) have no synchronous registry yet and remain a
+          // known blind spot on this path.
+          if (anySurfaceReferencesPluginConnection(tabs.value, usePluginBottomDock().entries.value, connectionId)) return;
           const connectionStore = useConnectionStore();
           const config = connectionStore.getConfig(connectionId);
           // A connection reference is not ownership: only a plugin-backed
@@ -5107,6 +5160,7 @@ export const useQueryStore = defineStore("query", () => {
       querySourceColumns: original.querySourceColumns ? [...original.querySourceColumns] : undefined,
       queryWriteTargets: original.queryWriteTargets?.map((target) => ({ ...target, sourceColumns: [...target.sourceColumns] })),
       resultColumnComments: original.resultColumnComments ? [...original.resultColumnComments] : undefined,
+      resultColumnTypeLabels: original.resultColumnTypeLabels ? [...original.resultColumnTypeLabels] : undefined,
       queryDisplaySourceColumns: original.queryDisplaySourceColumns ? [...original.queryDisplaySourceColumns] : undefined,
       queryEditabilityReason: original.queryEditabilityReason,
       resultEvicted: undefined,
@@ -6584,7 +6638,7 @@ export const useQueryStore = defineStore("query", () => {
    * identifiers keep exact casing. Ambiguous or unresolved columns yield
    * `undefined` (no comment) instead of first-source-wins on a shared name.
    */
-  function resolveResultColumnInfo(dbType: string, analysis: EditableQueryInfo, resultColumns: string[], loadedSources: LoadedEditableSource[]): { comments: Array<string | undefined>; mapping: Array<QueryResultSourceColumnRef | undefined> } {
+  function resolveResultColumnInfo(dbType: string, analysis: EditableQueryInfo, resultColumns: string[], loadedSources: LoadedEditableSource[]): { comments: Array<string | undefined>; typeLabels: Array<string | undefined>; mapping: Array<QueryResultSourceColumnRef | undefined> } {
     const refs = resolveSourceColumnsByOrdinal(
       dbType,
       analysis,
@@ -6592,16 +6646,29 @@ export const useQueryStore = defineStore("query", () => {
       resultColumns.length,
     );
     const comments: Array<string | undefined> = [];
+    const typeLabels: Array<string | undefined> = [];
     const mapping: Array<QueryResultSourceColumnRef | undefined> = [];
     for (const ref of refs) {
       if (!ref) {
         comments.push(undefined);
+        typeLabels.push(undefined);
         mapping.push(undefined);
         continue;
       }
       const loaded = loadedSources.find((entry) => entry.source.key === ref.sourceKey);
-      const comment = loaded?.tableMeta.columns.find((column) => column.name === ref.sourceColumn)?.comment?.trim();
+      const column = loaded?.tableMeta.columns.find((candidate) => candidate.name === ref.sourceColumn);
+      const comment = column?.comment?.trim();
       comments.push(comment || undefined);
+      typeLabels.push(
+        column
+          ? formatMetadataColumnTypeLabel({
+              dataType: column.data_type,
+              characterMaximumLength: column.character_maximum_length,
+              numericPrecision: column.numeric_precision,
+              numericScale: column.numeric_scale,
+            }) || undefined
+          : undefined,
+      );
       mapping.push({
         ...ref,
         database: loaded?.tableMeta.database,
@@ -6609,7 +6676,7 @@ export const useQueryStore = defineStore("query", () => {
         tableName: loaded?.tableMeta.tableName,
       });
     }
-    return { comments, mapping };
+    return { comments, typeLabels, mapping };
   }
 
   function mysqlColumnIsGenerated(column: { extra: string | null }): boolean {
@@ -6672,6 +6739,12 @@ export const useQueryStore = defineStore("query", () => {
     return databaseType !== "oracle" || !!loaded.tableMeta.tableType?.trim();
   }
 
+  function applyQueryDisplayMetadata(tab: QueryTab, display: QueryDisplayMetadataReady) {
+    if (display.resultColumnComments !== undefined) tab.resultColumnComments = display.resultColumnComments;
+    if (display.resultColumnTypeLabels !== undefined) tab.resultColumnTypeLabels = display.resultColumnTypeLabels;
+    if (display.queryDisplaySourceColumns !== undefined) tab.queryDisplaySourceColumns = display.queryDisplaySourceColumns;
+  }
+
   function applyQueryMetadataPatch(tab: QueryTab, patch: QueryMetadataPatch, databaseType?: DatabaseType, database?: string) {
     tab.queryAnalysis = patch.queryAnalysis;
     tab.querySourceColumns = patch.querySourceColumns;
@@ -6680,6 +6753,7 @@ export const useQueryStore = defineStore("query", () => {
     tab.mongoEditTarget = undefined;
     tab.tableMeta = patch.tableMeta;
     tab.resultColumnComments = patch.resultColumnComments;
+    tab.resultColumnTypeLabels = patch.resultColumnTypeLabels;
     tab.queryDisplaySourceColumns = patch.queryDisplaySourceColumns;
 
     if (patch.tableMeta?.tableName && tab.result?.sourceStatement && tab.result.sourceLabel) {
@@ -6846,6 +6920,51 @@ export const useQueryStore = defineStore("query", () => {
       elapsed: elapsed?.(),
     });
     return loadedEditableSourceFromMetadata(target, loadedMetadata.metadata);
+  }
+
+  /**
+   * Load JOIN/source table metadata in two phases so result headers can show
+   * comments and declared type lengths as soon as columns return, without
+   * waiting for index discovery / editability.
+   */
+  async function loadEditableSourcesWithEarlyDisplay(
+    tab: QueryTab,
+    analysis: EditableQueryInfo,
+    sources: EditableQuerySource[],
+    conn: ConnectionConfig | undefined,
+    dbType: string,
+    executionDatabase: string,
+    traceId: string | undefined,
+    elapsed: (() => string) | undefined,
+    onDisplayReady?: (display: QueryDisplayMetadataReady) => void,
+  ): Promise<LoadedEditableSource[]> {
+    const targets = sources.map((source) => resolveEditableSourceMetadataTarget(tab, analysis, source, conn, dbType, executionDatabase));
+    const limiterScope = `${GROUPED_DISPLAY_LIMITER_SCOPE_PREFIX}${tab.connectionId}`;
+
+    const columnSources = await Promise.all(
+      targets.map((target) =>
+        groupedDisplayMetadataLimiter.run(limiterScope, "query-column-comments", async () => {
+          const loadedColumns = await loadTableColumns({
+            ...target.request,
+            traceLogger: (event) => queryExecutionLog("debug", "metadata:table-columns-trace", { sourceTraceId: traceId, ...event }),
+          });
+          return loadedEditableSourceFromColumns(target, loadedColumns);
+        }),
+      ),
+    );
+
+    if (onDisplayReady && tab.result?.columns.length) {
+      const displayInfo = resolveResultColumnInfo(dbType, analysis, tab.result.columns, columnSources);
+      onDisplayReady({
+        resultColumnComments: displayInfo.comments,
+        resultColumnTypeLabels: displayInfo.typeLabels,
+        queryDisplaySourceColumns: displayInfo.mapping,
+      });
+    }
+
+    // Columns are warm in the shared cache; full loads only pay for indexes /
+    // primary-key resolution needed by editability. Multi-source stays bounded.
+    return Promise.all(sources.map((source) => groupedDisplayMetadataLimiter.run(limiterScope, "query-table-metadata", async () => loadEditableQuerySource(tab, analysis, source, conn, dbType, executionDatabase, traceId, elapsed))));
   }
 
   function missingPrimaryKeysForSource(databaseType: DatabaseType, primaryKeys: string[], analysis: EditableQueryInfo, sourceKey: string): string[] {
@@ -7087,17 +7206,16 @@ export const useQueryStore = defineStore("query", () => {
       // coordinator deduplicates identical tables across concurrent callers,
       // so this path issues no indexes requests and never loads full editable
       // metadata.
-      const loadedSources: LoadedEditableSource[] = [];
       const targets = sources.map((source) => resolveEditableSourceMetadataTarget(tab, analysis, source, conn, dbType, executionDatabase));
       const limiterScope = `${GROUPED_DISPLAY_LIMITER_SCOPE_PREFIX}${tab.connectionId}`;
-      await Promise.all(
+      const loadedSources = await Promise.all(
         targets.map((target) =>
           groupedDisplayMetadataLimiter.run(limiterScope, "query-column-comments", async () => {
             const loadedColumns = await loadTableColumns({
               ...target.request,
               traceLogger: (event) => queryExecutionLog("debug", "metadata:table-columns-trace", { sourceTraceId: traceId, ...event }),
             });
-            loadedSources.push(loadedEditableSourceFromColumns(target, loadedColumns));
+            return loadedEditableSourceFromColumns(target, loadedColumns);
           }),
         ),
       );
@@ -7108,6 +7226,7 @@ export const useQueryStore = defineStore("query", () => {
         queryEditabilityReason: readOnlyReason,
         tableMeta: undefined,
         resultColumnComments: displayInfo.comments,
+        resultColumnTypeLabels: displayInfo.typeLabels,
         queryDisplaySourceColumns: displayInfo.mapping,
       };
       if (!allowMysqlEditing || dbType !== "mysql" || (conn?.driver_profile || conn?.db_type) !== "mysql") return readOnlyPatch;
@@ -7156,6 +7275,7 @@ export const useQueryStore = defineStore("query", () => {
         queryEditabilityReason: undefined,
         tableMeta: target.tableMeta,
         resultColumnComments: displayInfo.comments,
+        resultColumnTypeLabels: displayInfo.typeLabels,
         queryDisplaySourceColumns: displayInfo.mapping,
       };
     } catch (err) {
@@ -7167,7 +7287,16 @@ export const useQueryStore = defineStore("query", () => {
     }
   }
 
-  async function buildQueryMetadataPatch(tab: QueryTab, sql: string, executionDatabase: string, traceId?: string, elapsed?: () => string, hiddenPrimaryKeys: HiddenPrimaryKeyProjection[] = [], connection?: ConnectionConfig): Promise<QueryMetadataPatch | undefined> {
+  async function buildQueryMetadataPatch(
+    tab: QueryTab,
+    sql: string,
+    executionDatabase: string,
+    traceId?: string,
+    elapsed?: () => string,
+    hiddenPrimaryKeys: HiddenPrimaryKeyProjection[] = [],
+    connection?: ConnectionConfig,
+    onDisplayReady?: (display: QueryDisplayMetadataReady) => void,
+  ): Promise<QueryMetadataPatch | undefined> {
     if (tab.mode !== "query") return;
     if (!tab.result || !tab.result.columns.length) {
       return {
@@ -7223,11 +7352,8 @@ export const useQueryStore = defineStore("query", () => {
     const conn = connection ?? useConnectionStore().getConfig(tab.connectionId);
     const dbType = conn?.db_type || "";
     const sources = editableQuerySources(analysis);
-    const loadedSources: LoadedEditableSource[] = [];
     try {
-      for (const source of sources) {
-        loadedSources.push(await loadEditableQuerySource(tab, analysis, source, conn, dbType, executionDatabase, traceId, elapsed));
-      }
+      const loadedSources = await loadEditableSourcesWithEarlyDisplay(tab, analysis, sources, conn, dbType, executionDatabase, traceId, elapsed, onDisplayReady);
 
       const allSourceColumns = loadedSources.map((source) => ({ source: source.source, columns: source.tableMeta.columns }));
       // Match DBeaver's safety model: a joined result is writable only when one
@@ -7272,6 +7398,7 @@ export const useQueryStore = defineStore("query", () => {
             queryEditabilityReason: "no-primary-key",
             tableMeta: loaded.tableMeta,
             resultColumnComments: displaySourceInfo.comments,
+            resultColumnTypeLabels: displaySourceInfo.typeLabels,
             queryDisplaySourceColumns: displaySourceInfo.mapping,
           };
         }
@@ -7283,6 +7410,7 @@ export const useQueryStore = defineStore("query", () => {
             querySourceColumns: undefined,
             queryEditabilityReason: "primary-key-not-returned",
             tableMeta: loaded.tableMeta,
+            resultColumnTypeLabels: displaySourceInfo.typeLabels,
             queryDisplaySourceColumns: displaySourceInfo.mapping,
           };
         }
@@ -7293,6 +7421,7 @@ export const useQueryStore = defineStore("query", () => {
             querySourceColumns: undefined,
             queryEditabilityReason: "aliased-columns",
             tableMeta: loaded.tableMeta,
+            resultColumnTypeLabels: displaySourceInfo.typeLabels,
             queryDisplaySourceColumns: displaySourceInfo.mapping,
           };
         }
@@ -7303,6 +7432,9 @@ export const useQueryStore = defineStore("query", () => {
           queryEditabilityReason: undefined,
           tableMeta: primaryKeys === loaded.tableMeta.primaryKeys ? loaded.tableMeta : { ...loaded.tableMeta, primaryKeys },
           resultColumnComments: primaryKeys.length === 0 ? displaySourceInfo.comments : undefined,
+          // Single-table editable results already expose declared types via
+          // tableMeta; keep ordinal labels only when comments also use that path.
+          resultColumnTypeLabels: primaryKeys.length === 0 ? displaySourceInfo.typeLabels : undefined,
           queryDisplaySourceColumns: displaySourceInfo.mapping,
         };
       }
@@ -7320,6 +7452,7 @@ export const useQueryStore = defineStore("query", () => {
           queryEditabilityReason: loadedSources.some((loaded) => loaded.tableMeta.primaryKeys.length > 0) ? "primary-key-not-returned" : "no-primary-key",
           tableMeta: undefined,
           resultColumnComments: multiSourceInfo?.comments,
+          resultColumnTypeLabels: multiSourceInfo?.typeLabels,
           queryDisplaySourceColumns: multiSourceInfo?.mapping,
         };
       }
@@ -7336,6 +7469,7 @@ export const useQueryStore = defineStore("query", () => {
           queryEditabilityReason: undefined,
           tableMeta: target.tableMeta,
           resultColumnComments: multiSourceInfo?.comments,
+          resultColumnTypeLabels: multiSourceInfo?.typeLabels,
           queryDisplaySourceColumns: multiSourceInfo?.mapping,
         };
       }
@@ -7358,6 +7492,7 @@ export const useQueryStore = defineStore("query", () => {
         queryEditabilityReason: undefined,
         tableMeta: target.tableMeta,
         resultColumnComments: multiSourceInfo?.comments,
+        resultColumnTypeLabels: multiSourceInfo?.typeLabels,
         queryDisplaySourceColumns: multiSourceInfo?.mapping,
       };
     } catch (err) {
@@ -7379,9 +7514,16 @@ export const useQueryStore = defineStore("query", () => {
       const tab = tabs.value.find((t) => t.id === tabId);
       if (!tab || tab.result !== result) return;
       queryExecutionLog("info", "metadata:start", { traceId, elapsed: elapsed() });
+      const applyDisplayReady = (display: QueryDisplayMetadataReady) => {
+        const current = tabs.value.find((t) => t.id === tabId);
+        if (!current || current.result !== result) return;
+        applyQueryDisplayMetadata(current, display);
+        syncActiveResultRunFromDisplayed(current);
+        queryExecutionLog("info", "metadata:display-ready", { traceId, elapsed: elapsed() });
+      };
       // Metadata requests outlive the displayed result when another query starts
       // or a retained run is selected. Analyze this result, not the live tab.
-      const patch = await buildQueryMetadataPatch({ ...tab, result }, sql, executionDatabase, traceId, elapsed, hiddenPrimaryKeys, connection);
+      const patch = await buildQueryMetadataPatch({ ...tab, result }, sql, executionDatabase, traceId, elapsed, hiddenPrimaryKeys, connection, applyDisplayReady);
       if (patch?.queryAnalysis && hasHiddenPhysicalRowKey(databaseType, hiddenPrimaryKeys)) {
         patch.queryAnalysis = { ...patch.queryAnalysis, allowInsert: false };
       }
@@ -7708,6 +7850,7 @@ export const useQueryStore = defineStore("query", () => {
     let pageSql: string | undefined;
     let requestedPageLimit: number | undefined;
     let pageLimit: number | undefined;
+    let pageProbeLimit: number | undefined;
     let pageOffset: number | undefined;
     let countSql: string | undefined;
     let exactQueryRowBound: number | undefined;
@@ -7844,6 +7987,7 @@ export const useQueryStore = defineStore("query", () => {
               current.queryAnalysis = undefined;
               current.querySourceColumns = undefined;
               current.resultColumnComments = undefined;
+              current.resultColumnTypeLabels = undefined;
               current.queryDisplaySourceColumns = undefined;
               current.mongoEditTarget = undefined;
               if (!producedResult) {
@@ -7912,6 +8056,7 @@ export const useQueryStore = defineStore("query", () => {
           current.querySourceColumns = undefined;
           current.queryWriteTargets = undefined;
           current.resultColumnComments = undefined;
+          current.resultColumnTypeLabels = undefined;
           current.queryDisplaySourceColumns = undefined;
           current.queryEditabilityReason = undefined;
           current.mongoEditTarget = undefined;
@@ -8380,6 +8525,7 @@ export const useQueryStore = defineStore("query", () => {
           current.querySourceColumns = undefined;
           current.queryWriteTargets = undefined;
           current.resultColumnComments = undefined;
+          current.resultColumnTypeLabels = undefined;
           current.queryDisplaySourceColumns = undefined;
           current.queryEditabilityReason = undefined;
           current.mongoEditTarget = mongoCommands.length === 1 ? mongoEditTarget : undefined;
@@ -8453,6 +8599,7 @@ export const useQueryStore = defineStore("query", () => {
           current.querySourceColumns = undefined;
           current.queryWriteTargets = undefined;
           current.resultColumnComments = undefined;
+          current.resultColumnTypeLabels = undefined;
           current.queryDisplaySourceColumns = undefined;
           current.queryEditabilityReason = undefined;
           current.mongoEditTarget = undefined;
@@ -8476,6 +8623,7 @@ export const useQueryStore = defineStore("query", () => {
         hiddenPrimaryKeys = prepared.hiddenPrimaryKeys;
         useLargeValuePreview = prepared.largeValuePreview;
         if (options?.querySort) {
+          const visibleColumnCount = options.querySort.resultColumns.length;
           const sorted = await api.buildSortedQuerySql({
             originalSql: sqlToExecute,
             databaseType: effectiveDbType,
@@ -8483,6 +8631,7 @@ export const useQueryStore = defineStore("query", () => {
             columnIndex: options.querySort.columnIndex,
             column: options.querySort.column,
             direction: options.querySort.direction,
+            tieBreakerColumnIndexes: hiddenPrimaryKeys.map((_, index) => visibleColumnCount + index),
           });
           if (!sorted.ok || !sorted.sql) throw new Error("Unable to build sorted query SQL");
           sqlToExecute = sorted.sql;
@@ -8500,6 +8649,7 @@ export const useQueryStore = defineStore("query", () => {
           pagination,
           useAgentCursor,
           firstPageUsesActualSql: hiddenPrimaryKeys.length > 0,
+          executionHint: effectiveDbType === "gaussdb" ? gaussdbCountQueryDopHint(conn) : undefined,
         });
         const canPaginateSqlServerUseScript = !!sqlServerUseScript && !!plan.pageSql && typeof plan.pageLimit === "number" && typeof plan.pageOffset === "number";
         if (plan.paginationError) throw new Error(plan.paginationError);
@@ -8509,8 +8659,12 @@ export const useQueryStore = defineStore("query", () => {
         if (sqlServerUseScript && !canPaginateSqlServerUseScript) {
           sqlToExecute = sqlBeforePagination;
         } else {
-          sqlToExecute = sqlServerUseScript ? replaceSqlServerLeadingUseQuery(sqlBeforePagination, sqlServerUseScript, plan.sqlToExecute) : plan.sqlToExecute;
-          pageSql = sqlServerUseScript && plan.pageSql ? replaceSqlServerLeadingUseQuery(sqlBeforePagination, sqlServerUseScript, plan.pageSql) : plan.pageSql;
+          // Only the backend's strict read-only proof may enable an extra row.
+          // Older backends omit pageProbeSql and retain their original behavior.
+          const probeSql = effectiveDbType === "mysql" && !plan.useAgentResultSession && plan.pageSql && typeof plan.pageLimit === "number" ? plan.pageProbeSql : undefined;
+          sqlToExecute = sqlServerUseScript ? replaceSqlServerLeadingUseQuery(sqlBeforePagination, sqlServerUseScript, plan.sqlToExecute) : (probeSql ?? plan.sqlToExecute);
+          pageSql = sqlServerUseScript && plan.pageSql ? replaceSqlServerLeadingUseQuery(sqlBeforePagination, sqlServerUseScript, plan.pageSql) : (probeSql ?? plan.pageSql);
+          pageProbeLimit = probeSql && typeof plan.pageLimit === "number" ? plan.pageLimit + 1 : undefined;
           pageLimit = plan.pageLimit;
           pageOffset = plan.pageOffset;
           countSql = sqlServerUseScript && plan.countSql ? replaceSqlServerLeadingUseQuery(queryBaseSql, sqlServerUseScript, plan.countSql) : plan.countSql;
@@ -8543,6 +8697,25 @@ export const useQueryStore = defineStore("query", () => {
         pageLimit = pagination.limit;
         pageOffset = pagination.offset;
         useAgentResultSession = usesAgentCursorForTableData(conn?.db_type, conn?.driver_profile);
+        if (effectiveDbType === "mysql" && !useAgentCursor && !useAgentResultSession) {
+          // Data tabs already contain the generated LIMIT/OFFSET. Remove that
+          // page bound before planning, otherwise it hides the extra probe row
+          // (or applies the offset twice). The backend still proves read safety.
+          const baseSql = mysqlTablePageBaseSql(sqlToExecute, pageLimit, pageOffset);
+          if (baseSql) {
+            const plan = await api.prepareQueryPaginationExecutionPlan({
+              sql: baseSql,
+              queryBaseSql: sqlToExecute,
+              databaseType: effectiveDbType,
+              pagination,
+              useAgentCursor: false,
+            });
+            if (plan.pageProbeSql) {
+              sqlToExecute = plan.pageProbeSql;
+              pageProbeLimit = pageLimit + 1;
+            }
+          }
+        }
       }
 
       errorLocateContext = {
@@ -8587,7 +8760,7 @@ export const useQueryStore = defineStore("query", () => {
                   pageSize: pageLimit,
                   resultSessionId: options?.pagination?.sessionId,
                 }
-              : { maxRows: pageLimit, fetchSize: pageLimit }
+              : { maxRows: pageProbeLimit ?? pageLimit, fetchSize: pageProbeLimit ?? pageLimit }
             : { maxRows: agentProtocolQueryResultMaxRows(queryResultMaxRows) }),
           ...(useJdbcDriverRowOffset && typeof pageOffset === "number" && pageOffset > 0 ? { rowOffset: pageOffset } : {}),
           ...(executionClientSessionId ? { clientSessionId: executionClientSessionId } : {}),
@@ -8742,7 +8915,7 @@ export const useQueryStore = defineStore("query", () => {
                 sqlToExecute,
                 executionDatabase,
                 executionSchema,
-                cursor ? agentProtocolQueryResultMaxRows(queryResultMaxRows) : (pageLimit ?? agentProtocolQueryResultMaxRows(queryResultMaxRows)),
+                cursor ? agentProtocolQueryResultMaxRows(queryResultMaxRows) : (pageProbeLimit ?? pageLimit ?? agentProtocolQueryResultMaxRows(queryResultMaxRows)),
                 useLargeValuePreview,
                 cursor ? pageLimit : undefined,
                 cursor ? options?.pagination?.sessionId : undefined,
@@ -8761,15 +8934,20 @@ export const useQueryStore = defineStore("query", () => {
             } catch (error) {
               if (effectiveDbType === "sqlserver" || options?.pagination?.sessionId || manualTransactionRecoveryAttempted || !isManualTransactionSessionExpired(error)) throw error;
               if (tab.executionId !== executionId || tab.autoCommit !== false || manualTransactionTargetEpoch(tab) !== executionTargetEpoch) throw error;
+              // Only a session that ran proven read-only statements lost nothing to
+              // the idle rollback and can be rebuilt transparently. Otherwise
+              // uncommitted work was discarded (or we cannot prove it was not), and
+              // replaying this statement into a fresh transaction would silently
+              // act on state that no longer exists. Stop here: the outer handler
+              // clears the dead session and shows the rollback notice, and the
+              // user decides whether to run the statement again.
+              if (manualTransactionRollbackNoticeRequired(tab, effectiveDbType)) throw error;
               manualTransactionRecoveryAttempted = true;
-              // A session that only ever ran proven read-only statements lost
-              // nothing to the idle rollback, so it restarts without the notice.
-              const rollbackNoticeRequired = manualTransactionRollbackNoticeRequired(tab, effectiveDbType);
               // The expired session was discarded by the backend; the replacement
               // session starts fresh, so the old sticky state resets with it.
               clearTxnPossiblyDirty(tab);
               tab.txnSessionId = undefined;
-              tab.txnAutoRolledBack = rollbackNoticeRequired;
+              tab.txnAutoRolledBack = false;
               queryExecutionLog("info", "manual-txn:expired-recover", { traceId, elapsed: elapsed() });
               const refreshedSessionId = await ensureManualTransactionSession(id, executionDatabase, executionSchema, executionCatalog);
               if (tab.executionId !== executionId || tab.autoCommit !== false || manualTransactionTargetEpoch(tab) !== executionTargetEpoch) {
@@ -8822,6 +9000,9 @@ export const useQueryStore = defineStore("query", () => {
       const resultProcessingStartedAt = performance.now();
       const annotatedResults = annotateQueryResultSources(markQueryResultsRowsRaw(responseResults), queryBaseSql, sourceLabelDatabase, effectiveDbType, options?.sourceOffset, sqlStatementParameterOptions, sqlToExecute, options?.sourceOffset === undefined ? undefined : tab.sql);
       const results = offsetBatchQueryResultIndexes(annotatedResults.results, batchResume?.startStatementIndex ?? 0);
+      if (pageProbeLimit !== undefined && pageLimit !== undefined && results.length === 1) {
+        results[0] = markQueryResultRowsRaw(trimQueryPageProbe(results[0]!, pageLimit));
+      }
       if (paginationRowNumberColumn && results.length === 1) {
         results[0] = markQueryResultsRowsRaw([stripPaginationRowNumber(results[0]!, paginationRowNumberColumn)])[0]!;
       }
@@ -8984,13 +9165,21 @@ export const useQueryStore = defineStore("query", () => {
         const resultLimitReached = !!current.result && queryResultLimitReached(resultStartOffset, resultRowCount, queryResultMaxRows);
         if (resultLimitReached && current.result) {
           current.result.has_more = false;
-          current.result.truncated = true;
+          current.result.truncated = current.result.page_has_more !== false;
           current.resultTotalRowCount = queryResultMaxRows;
         }
         const paginationPageResult = shouldAppendResult ? results[0] : current.result;
         const exactIncompletePageTotal = paginationPageResult ? exactTotalFromIncompletePage(paginationPageResult, pageLimit, pageOffset, useAgentResultSession) : undefined;
         const totalKnownFromIncompletePage = typeof exactIncompletePageTotal === "number";
         let totalRowCountResolved = false;
+        if (paginationPageResult?.page_has_more === false && typeof exactIncompletePageTotal === "number") {
+          current.resultTotalRowCount = exactIncompletePageTotal;
+          current.resultTotalRowCountLoading = false;
+          totalRowCountResolved = true;
+        } else if (paginationPageResult?.page_has_more === true && typeof current.resultTotalRowCount === "number" && current.resultTotalRowCount <= (pageOffset ?? 0) + paginationPageResult.rows.length && !resultLimitReached) {
+          // A previous count belongs to an older snapshot; the probe proves it stale.
+          current.resultTotalRowCount = undefined;
+        }
         if (current.mode === "query" && current.result && !isQueryExecutionErrorResult(current.result) && typeof exactQueryRowBound === "number") {
           const boundedTotal = capQueryResultTotal(exactQueryRowBound, queryResultMaxRows);
           current.resultTotalRowCount = Math.min(boundedTotal, exactIncompletePageTotal ?? boundedTotal);
@@ -9089,7 +9278,7 @@ export const useQueryStore = defineStore("query", () => {
         reportSqlServerTransactionError(tab, e);
       } else if (tab.autoCommit === false) {
         const errMsg: string = e?.message ?? String(e);
-        const idleTimeout = /5 minutes of inactivity/i.test(errMsg) || errMsg.includes("5 分钟无操作") || errMsg.includes("已自动回滚");
+        const idleTimeout = isManualTransactionSessionExpired(e) || errMsg.includes("已自动回滚");
         if (idleTimeout) {
           // Backend session was removed and rolled back after idle expiry: clear
           // the sticky dirty state together with the session. Same rule as the
@@ -9148,6 +9337,7 @@ export const useQueryStore = defineStore("query", () => {
         current.querySourceColumns = undefined;
         current.queryWriteTargets = undefined;
         current.resultColumnComments = undefined;
+        current.resultColumnTypeLabels = undefined;
         current.queryDisplaySourceColumns = undefined;
         current.queryEditabilityReason = undefined;
         current.mongoEditTarget = undefined;
@@ -9801,6 +9991,7 @@ export const useQueryStore = defineStore("query", () => {
     tab.querySourceColumns = undefined;
     tab.queryWriteTargets = undefined;
     tab.resultColumnComments = undefined;
+    tab.resultColumnTypeLabels = undefined;
     tab.queryDisplaySourceColumns = undefined;
     tab.queryEditabilityReason = undefined;
     tab.mongoEditTarget = undefined;
@@ -9933,6 +10124,7 @@ export const useQueryStore = defineStore("query", () => {
     tab.querySourceColumns = snapshot.querySourceColumns;
     tab.queryWriteTargets = snapshot.queryWriteTargets;
     tab.resultColumnComments = snapshot.resultColumnComments;
+    tab.resultColumnTypeLabels = snapshot.resultColumnTypeLabels;
     tab.queryDisplaySourceColumns = snapshot.queryDisplaySourceColumns;
     tab.queryEditabilityReason = snapshot.queryEditabilityReason;
     tab.mongoEditTarget = snapshot.mongoEditTarget;
@@ -10186,12 +10378,13 @@ export const useQueryStore = defineStore("query", () => {
     // Appended segments retain resultPageOffset=0, so inspect their last page.
     const sourceSnapshotComplete =
       sourceResult.has_more === false &&
+      sourceResult.page_has_more !== true &&
       !sourceResult.truncated &&
       !sourceResult.large_value_cells?.length &&
       !sourceResult.execution_error &&
       sourcePageOffset === 0 &&
       (typeof sourceTotalRows !== "number" || sourceTotalRows <= sourceResult.rows.length) &&
-      (!tab.resultPageSql || hasShortDataGridSqlPage({ rowCount: sourceResult.rows.length, pageOffset: sourcePageOffset, executedPageOffset: sourceLastPageOffset, executedPageLimit: sourcePageLimit }));
+      (!tab.resultPageSql || sourceResult.page_has_more === false || hasShortDataGridSqlPage({ rowCount: sourceResult.rows.length, pageOffset: sourcePageOffset, executedPageOffset: sourceLastPageOffset, executedPageLimit: sourcePageLimit }));
     const sourceHiddenNames = new Set((sourceResult.hidden_column_indexes ?? []).map((index) => sourceResult.columns[index]).filter((name): name is string => name !== undefined && sourceResult.columns.filter((column) => column === name).length === 1));
     const resultForTransfer = (result: QueryResult): QueryResult => {
       if (!probeRowLimit) return result;
@@ -10358,6 +10551,7 @@ export const useQueryStore = defineStore("query", () => {
           pagination: { limit: effectivePageLimit, offset, sessionId },
           useAgentCursor,
           firstPageUsesActualSql: true,
+          executionHint: effectiveDbType === "gaussdb" ? gaussdbCountQueryDopHint(conn) : undefined,
         });
         if (probeRowLimit && plan.paginationError) throw new Error(plan.paginationError);
         if (typeof plan.pageLimit !== "number" || typeof plan.pageOffset !== "number") return cachedResultForExport();
@@ -10675,6 +10869,9 @@ export const useQueryStore = defineStore("query", () => {
     openMqttAdmin,
     openNacosAdmin,
     openPluginWorkbench,
+    setPluginWorkbenchTabTitle,
+    getPluginWorkbenchTabTitle,
+    pluginWorkbenchTitles,
     localizePluginTabTitles,
     openPluginFilesystem,
     reconnectRestoredPluginTabs,

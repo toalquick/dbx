@@ -74,13 +74,16 @@ const contentEmits = createContentSurfaceEventForwarders(emit);
 const surfaceBindings = computed(() => ({ ...surfaceProps.value, ...contentEmits }));
 
 const activeSurfaceRef = ref<QueryEditorSurfaceHandle | null>(null);
-const editorToolbarRef = ref<InstanceType<typeof EditorToolbar> | null>(null);
+const toolbarRef = ref<InstanceType<typeof EditorToolbar> | null>(null);
 
 defineExpose({
   focusSearch: (target: Element | null = null) => activeSurfaceRef.value?.focusSearch(target) ?? false,
+  openConnectionPicker: () => toolbarRef.value?.openConnectionPicker() ?? false,
+  openDatabasePicker: () => toolbarRef.value?.openDatabasePicker() ?? false,
+  openSchemaPicker: () => toolbarRef.value?.openSchemaPicker() ?? false,
   focusWhere: () => activeSurfaceRef.value?.focusWhere() ?? false,
   openGoToColumn: () => activeSurfaceRef.value?.openGoToColumn() ?? false,
-  openDatabaseSelect: () => editorToolbarRef.value?.openDatabaseSelect() ?? false,
+  openDatabaseSelect: () => toolbarRef.value?.openDatabaseSelect() ?? false,
   openTableStructureEditor: (initialTab?: TableInfoTab) => activeSurfaceRef.value?.openTableStructureEditor?.(initialTab) ?? false,
   // Same action as the toolbar's commit button (Shift+Mod+C default). Only
   // reports handled when the active tab holds a committable transaction, so
@@ -220,6 +223,7 @@ const groupExecutableSql = computed(() => {
         @close-plugin-center="toolbar.closePluginCenter()"
         @activate-driver-store="toolbar.activateDriverStore()"
         @close-driver-store="toolbar.closeDriverStore()"
+        @save-all-tabs="toolbar.saveAllTabs()"
       />
     </Teleport>
     <!-- The toolbar stays at the top of the pane's content column in every
@@ -229,7 +233,7 @@ const groupExecutableSql = computed(() => {
     <div v-show="!contentSuppressed" class="flex min-h-0 min-w-0 flex-1 flex-col">
       <EditorToolbar
         v-if="activeTab && showGroupToolbar"
-        ref="editorToolbarRef"
+        ref="toolbarRef"
         :active-tab="activeTab"
         :active-connection="activeConnection"
         :executable-sql="groupExecutableSql"

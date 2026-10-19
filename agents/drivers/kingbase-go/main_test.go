@@ -68,6 +68,7 @@ type modeDetectionDriverState struct {
 	queries             []string
 	databaseMode        *string
 	backtickIdentifiers bool
+	nullCurrentSchema   bool
 	databaseErr         error
 }
 
@@ -253,9 +254,13 @@ func (connection *modeDetectionConn) QueryContext(_ context.Context, query strin
 
 	switch {
 	case strings.Contains(query, "SELECT current_database()"):
+		var schema driver.Value = "public"
+		if connection.state.nullCurrentSchema {
+			schema = nil
+		}
 		return &valueRows{
 			columns: []string{"current_database", "current_user", "version", "current_schema"},
-			rows:    [][]driver.Value{{"test", "system", "KingbaseES", "public"}},
+			rows:    [][]driver.Value{{"test", "system", "KingbaseES", schema}},
 		}, nil
 	case strings.Contains(query, "LOWER(name) = 'database_mode'"):
 		if connection.state.databaseErr != nil {
@@ -4500,6 +4505,25 @@ func TestConnectionInfoReportsCompatibilityIdentifierQuote(t *testing.T) {
 	}
 }
 
+func TestConnectionInfoAllowsNullCurrentSchema(t *testing.T) {
+	db := openModeDetectionDB(t, &modeDetectionDriverState{nullCurrentSchema: true})
+	server := newServer()
+	server.db = db
+	server.mode.compatibilityMode = "mysql"
+	server.mode.mysqlCompat = true
+
+	info, err := server.connectionInfo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info["schema"] != "" {
+		t.Fatalf("unexpected schema: %#v", info["schema"])
+	}
+	if info["identifierQuote"] != "`" {
+		t.Fatalf("unexpected identifier quote: %#v", info["identifierQuote"])
+	}
+}
+
 func TestDetectMySQLCompatModeProbesBacktickSyntaxWhenDatabaseModeMissing(t *testing.T) {
 	state := &modeDetectionDriverState{backtickIdentifiers: true}
 	db := openModeDetectionDB(t, state)
@@ -4936,7 +4960,7 @@ func containsString(values []string, target string) bool {
 }
 
 // Regression test for https://github.com/t8y2/dbx/issues/7681: a timezone-less
-// "timestamp"/"date"/"time" column must not be labeled as an absolute UTC
+// "timestamp"/"date" column must not be labeled as an absolute UTC
 // instant (RFC3339Nano with a "Z"/offset suffix), or clients that convert it
 // to a display timezone will double-apply the shift.
 func TestNormalizeValueKingbaseTimezoneLessDateTime(t *testing.T) {
@@ -4944,7 +4968,7 @@ func TestNormalizeValueKingbaseTimezoneLessDateTime(t *testing.T) {
 	// the process-local zone, which is not a real UTC instant.
 	wallClock := time.Date(2026, time.January, 30, 10, 0, 3, 0, time.UTC)
 
-	for _, columnType := range []string{"TIMESTAMP", "timestamp", "DATE", "TIME"} {
+	for _, columnType := range []string{"TIMESTAMP", "timestamp", "DATE"} {
 		got := normalizeValue(wallClock, columnType)
 		want := "2026-01-30T10:00:03"
 		gotStr, ok := got.(string)
@@ -4964,6 +4988,24 @@ func TestNormalizeValueKingbaseTimezoneLessDateTime(t *testing.T) {
 	tzAwareStr, ok := tzAware.(string)
 	if !ok || tzAwareStr != "2026-01-30T10:00:03Z" {
 		t.Fatalf("TIMESTAMPTZ column: got %#v, want RFC3339Nano-encoded UTC instant", tzAware)
+	}
+}
+
+// Regression test for https://github.com/t8y2/dbx/issues/12188: gokb decodes a
+// "time" column into a time.Time on Go's zero date, so the date part must not
+// reach the client. Showing it rendered every time of day as 0000-01-01T17:19:34.
+func TestNormalizeValueKingbaseTimeColumnKeepsTimeOfDay(t *testing.T) {
+	timeOfDay := time.Date(0, time.January, 1, 17, 19, 34, 0, time.UTC)
+
+	for _, columnType := range []string{"TIME", "time", "time without time zone"} {
+		got := normalizeValue(timeOfDay, columnType)
+		gotStr, ok := got.(string)
+		if !ok {
+			t.Fatalf("columnType=%s: expected a string, got %#v", columnType, got)
+		}
+		if gotStr != "17:19:34" {
+			t.Fatalf("columnType=%s: got %q, want %q", columnType, gotStr, "17:19:34")
+		}
 	}
 }
 

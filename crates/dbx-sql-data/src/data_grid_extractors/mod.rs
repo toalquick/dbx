@@ -15,7 +15,10 @@ use delimited::{write_dsv, write_one_row};
 use document::{write_html, write_markdown, write_pretty, write_xml};
 use json::{write_json, write_json_lines};
 use raw::write_raw;
-use sql::{write_sql_in_list, write_sql_inserts, write_sql_select, write_sql_updates, write_where_clause};
+use sql::{
+    write_sql_deletes_inserts, write_sql_in_list, write_sql_inserts, write_sql_select, write_sql_updates,
+    write_where_clause,
+};
 
 const DATA_GRID_EXTRACTOR_MAX_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const DATA_GRID_EXTRACTOR_MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
@@ -312,6 +315,7 @@ fn write_extraction(
             Ok(text_metadata("application/sql", "sql"))
         }
         DataGridExtractorId::SqlInserts => write_sql_inserts(context, output),
+        DataGridExtractorId::SqlDeletesInserts => write_sql_deletes_inserts(context, output),
         DataGridExtractorId::SqlUpdates => write_sql_updates(context, output),
         DataGridExtractorId::SqlSelect => {
             write_sql_select(context, output)?;
@@ -360,6 +364,39 @@ fn value_text(value: &Value) -> Cow<'_, str> {
         Value::Number(value) => Cow::Owned(value.to_string()),
         Value::Array(_) | Value::Object(_) => Cow::Owned(value.to_string()),
     }
+}
+
+/// Strings 引号策略（mod 42）的类型判定：JSON 字符串与 JSON 化的对象/数组
+/// 按文本加引号，数值/布尔裸写。
+fn value_string_like(value: &Value) -> bool {
+    matches!(value, Value::String(_) | Value::Array(_) | Value::Object(_))
+}
+
+/// MySQL 系驱动在文本协议下把所有标量都以 JSON 字符串送达（tinyint/int 与
+/// varchar 同样是 `Value::String`），仅凭值类型无法区分数值与文本；因此
+/// Strings 策略在列类型可辨时优先按列类型判定。这里收录各家驱动的数值/
+/// 布尔类型首词（information_schema 的 `tinyint(1) unsigned`、协议裸名
+/// `tinyint`、Postgres 的 `int8`、ClickHouse 的 `UInt32` 等）。
+const NUMERIC_DATA_TYPE_WORDS: &[&str] = &[
+    "tinyint", "smallint", "mediumint", "int", "integer", "bigint", "int2", "int4", "int8", "int16", "int32",
+    "int64", "int128", "uint8", "uint16", "uint32", "uint64", "uint128", "decimal", "numeric", "dec", "fixed",
+    "number", "money", "smallmoney", "float", "float4", "float8", "double", "real", "bit", "bool", "boolean",
+    "serial", "bigserial", "smallserial", "year",
+];
+
+fn data_type_is_numeric(data_type: Option<&str>) -> bool {
+    let Some(data_type) = data_type else { return false };
+    let first_word = data_type.split(|ch: char| ch.is_whitespace() || ch == '(').next().unwrap_or("");
+    NUMERIC_DATA_TYPE_WORDS.iter().any(|word| first_word.eq_ignore_ascii_case(word))
+}
+
+/// Strings 引号策略（mod 42）的综合判定：数值/布尔列即使以 JSON 字符串到达
+/// （MySQL 文本协议）也裸写；其余列回退值类型判定（字符串/对象/数组加引号）。
+fn strings_policy_string_like(value: &Value, data_type: Option<&str>) -> bool {
+    if data_type_is_numeric(data_type) {
+        return false;
+    }
+    value_string_like(value)
 }
 
 fn write_bytes(output: &mut dyn Write, bytes: &[u8]) -> Result<(), DataGridExtractError> {

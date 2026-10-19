@@ -137,7 +137,6 @@ const { loadSchemaOptions, getSchemaOptionsForDb, isLoadingSchemas, isSchemaAwar
 
 const toolbarRootRef = ref<HTMLElement | null>(null);
 const toolbarActionsRef = ref<HTMLElement | null>(null);
-const databaseSelectRef = ref<InstanceType<typeof SearchableSelect> | null>(null);
 // Set while the database dropdown was opened programmatically via the F3
 // shortcut (openDatabaseSelect): picking a database then — Enter or click —
 // hands focus to the query editor. Cleared when the dropdown closes without
@@ -150,10 +149,13 @@ const toolbarTier = ref<EditorToolbarTier>(0);
 // database / connection types without one) so the caller leaves F3 alone.
 defineExpose({
   openDatabaseSelect: () => {
-    const opened = databaseSelectRef.value?.openDropdown() ?? false;
+    const opened = databasePickerRef.value?.openDropdown() ?? false;
     if (opened) databaseSelectOpenedViaShortcut.value = true;
     return opened;
   },
+  openConnectionPicker: () => connectionPickerRef.value?.openDropdown() ?? false,
+  openDatabasePicker: () => databasePickerRef.value?.openDropdown() ?? false,
+  openSchemaPicker: () => schemaPickerRef.value?.openDropdown() ?? false,
 });
 
 // The database change settles first (EditorGroup switches the tab's database);
@@ -583,6 +585,10 @@ async function changeCatalog(selectedCatalog: string) {
     switchingCatalog.value = false;
   }
 }
+
+const connectionPickerRef = ref<InstanceType<typeof ConnectionTreeSelect> | null>(null);
+const databasePickerRef = ref<InstanceType<typeof SearchableSelect> | null>(null);
+const schemaPickerRef = ref<InstanceType<typeof SearchableSelect> | null>(null);
 </script>
 
 <template>
@@ -972,6 +978,7 @@ async function changeCatalog(selectedCatalog: string) {
       <div class="flex shrink-0 items-center gap-1">
         <span v-if="activeConnection?.color" class="h-4 w-1 rounded-full shrink-0" :style="{ backgroundColor: activeConnection.color }" />
         <ConnectionTreeSelect
+          ref="connectionPickerRef"
           :model-value="activeConnectionValue"
           :connections="connectionStore.connections"
           :layout="connectionStore.sidebarLayout"
@@ -1037,7 +1044,7 @@ async function changeCatalog(selectedCatalog: string) {
         :class="{ 'database-required-prompt': databaseRequiredVisible }"
       >
         <SearchableSelect
-          ref="databaseSelectRef"
+          ref="databasePickerRef"
           :model-value="activeDatabaseValue"
           :options="activeDatabaseOptions.length ? activeDatabaseOptions : activeDatabaseValue ? [activeDatabaseValue] : []"
           :placeholder="t('editor.selectDatabase')"
@@ -1094,6 +1101,7 @@ async function changeCatalog(selectedCatalog: string) {
       </div>
       <div v-if="showSchemaSelector" class="flex shrink-0 items-center gap-1">
         <SearchableSelect
+          ref="schemaPickerRef"
           :model-value="activeSchemaValue"
           :options="activeSchemaOptions.length ? activeSchemaOptions : activeSchemaValue ? [activeSchemaValue] : []"
           :placeholder="t('editor.selectSchema')"
